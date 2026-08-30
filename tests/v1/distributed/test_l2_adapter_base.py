@@ -315,6 +315,49 @@ class TestStoreReservations:
             adapter._release_store_reservation(1)
 
 
+class TestInitialUsage:
+    def test_seeds_aggregate_and_per_salt_without_event(self):
+        adapter = _StubAdapter(max_capacity_bytes=1_000)
+        adapter._event_bus = Mock()
+        first = _make_key(1, salt="alice")
+        second = _make_key(2, salt="bob")
+
+        adapter._initialize_usage({first: 100, second: 250})
+
+        usage = adapter.get_usage()
+        assert usage.total_bytes_used == 350
+        assert usage.bytes_by_cache_salt == {"alice": 100, "bob": 250}
+        adapter._event_bus.publish.assert_not_called()
+
+    @pytest.mark.parametrize("size", [0, -1, 1.5, True])
+    def test_rejects_invalid_existing_sizes(self, size):
+        adapter = _StubAdapter()
+        with pytest.raises(ValueError, match="positive integers"):
+            adapter._initialize_usage({_make_key(1): size})
+
+    def test_rejects_reinitialization_and_active_reservations(self):
+        adapter = _StubAdapter(max_capacity_bytes=1_000)
+        adapter._initialize_usage({_make_key(1): 100})
+        with pytest.raises(RuntimeError, match="already been initialized"):
+            adapter._initialize_usage({_make_key(2): 100})
+
+        reserved = _StubAdapter(max_capacity_bytes=1_000)
+        assert reserved._try_reserve_store_bytes(1)
+        with pytest.raises(RuntimeError, match="already been initialized"):
+            reserved._initialize_usage({_make_key(1): 100})
+
+        empty = _StubAdapter()
+        empty._initialize_usage({})
+        with pytest.raises(RuntimeError, match="already been initialized"):
+            empty._initialize_usage({})
+
+    def test_default_inventory_is_immutable(self):
+        snapshot = _StubAdapter().get_existing_key_sizes()
+        assert snapshot == {}
+        with pytest.raises(TypeError):
+            snapshot[_make_key(1)] = 1  # type: ignore[index]
+
+
 # ---------------------------------------------------------------------------
 # Listener notifications still fire (regression guard for the refactor)
 # ---------------------------------------------------------------------------

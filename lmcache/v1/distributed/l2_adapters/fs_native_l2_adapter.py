@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # Standard
 from typing import TYPE_CHECKING, Optional
+import os
 
 if TYPE_CHECKING:
     from lmcache.v1.distributed.internal_api import (
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
 )
@@ -29,8 +31,103 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+    _filename_to_object_key,
+)
 
 logger = init_logger(__name__)
+
+_FILE_EXT = ".data"
+_IGNORED_FILE_SAMPLE_LIMIT = 5
+
+
+def _scan_existing_key_sizes(base_path: str) -> dict[ObjectKey, int]:
+    """Inventory complete native-FS objects before the client starts.
+
+    Only direct, regular, positive-size ``.data`` files with filenames
+    reversible by the current ObjectKey codec are counted. Entries are returned
+    oldest-to-newest by ``(mtime_ns, filename)`` so an LRU policy can reconstruct
+    a deterministic best-effort order. The cache directory is expected to be
+    quiescent (or exclusively owned by this server) during startup: a file that
+    disappears during the scan is skipped, while every other I/O error fails
+    construction instead of silently undercounting capacity.
+    """
+    records: list[tuple[int, str, ObjectKey, int]] = []
+    ignored_data_files: list[str] = []
+    ignored_data_count = 0
+
+    try:
+        entries = os.scandir(base_path)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to scan native FS cache directory {base_path!r}: {exc}"
+        ) from exc
+
+    try:
+        with entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Failed to inspect native FS cache entry {entry.path!r}: {exc}"
+                    ) from exc
+
+                key = _filename_to_object_key(entry.name)
+                if key is None:
+                    if entry.name.endswith(_FILE_EXT):
+                        ignored_data_count += 1
+                        if len(ignored_data_files) < _IGNORED_FILE_SAMPLE_LIMIT:
+                            ignored_data_files.append(entry.name)
+                    continue
+
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    # A concurrent cleanup can remove an entry between listing
+                    # and stat. No controller is connected to this adapter yet.
+                    continue
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Failed to stat native FS cache entry {entry.path!r}: {exc}"
+                    ) from exc
+
+                if stat.st_size <= 0:
+                    ignored_data_count += 1
+                    if len(ignored_data_files) < _IGNORED_FILE_SAMPLE_LIMIT:
+                        ignored_data_files.append(entry.name)
+                    continue
+                records.append((stat.st_mtime_ns, entry.name, key, stat.st_size))
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed while scanning native FS cache directory {base_path!r}: {exc}"
+        ) from exc
+
+    if ignored_data_count:
+        logger.warning(
+            "Ignored %d unrecognized or empty native FS .data files during "
+            "restart inventory (sample=%s)",
+            ignored_data_count,
+            ignored_data_files,
+        )
+
+    records.sort(key=lambda record: (record[0], record[1]))
+    key_sizes: dict[ObjectKey, int] = {}
+    for _mtime_ns, filename, key, size in records:
+        if key in key_sizes:
+            raise RuntimeError(
+                "Native FS restart inventory found multiple filenames for the "
+                f"same ObjectKey (latest={filename!r})"
+            )
+        key_sizes[key] = size
+    return key_sizes
 
 
 class FSNativeL2AdapterConfig(L2AdapterConfigBase):
@@ -144,6 +241,7 @@ def _create_fs_native_l2_adapter(
     )
 
     assert isinstance(config, FSNativeL2AdapterConfig)
+    initial_key_sizes = _scan_existing_key_sizes(config.base_path)
     native_client = LMCacheFSClient(
         config.base_path,
         config.num_workers,
@@ -151,24 +249,33 @@ def _create_fs_native_l2_adapter(
         config.use_odirect,
         config.read_ahead_size or 0,
     )
+    try:
+        adapter = NativeConnectorL2Adapter(
+            native_client,
+            max_capacity_gb=config.max_capacity_gb,
+            type_name="FSNativeL2Adapter",
+            extra_status={
+                "base_path": config.base_path,
+                "use_odirect": config.use_odirect,
+                "num_workers": config.num_workers,
+                "read_ahead_size": config.read_ahead_size,
+            },
+            initial_key_sizes=initial_key_sizes,
+        )
+    except Exception:
+        native_client.close()
+        raise
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, "
+        "read_ahead=%s, restored_keys=%d, restored_bytes=%d)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
         config.read_ahead_size,
+        len(initial_key_sizes),
+        sum(initial_key_sizes.values()),
     )
-    return NativeConnectorL2Adapter(
-        native_client,
-        max_capacity_gb=config.max_capacity_gb,
-        type_name="FSNativeL2Adapter",
-        extra_status={
-            "base_path": config.base_path,
-            "use_odirect": config.use_odirect,
-            "num_workers": config.num_workers,
-            "read_ahead_size": config.read_ahead_size,
-        },
-    )
+    return adapter
 
 
 register_l2_adapter_type("fs_native", FSNativeL2AdapterConfig)

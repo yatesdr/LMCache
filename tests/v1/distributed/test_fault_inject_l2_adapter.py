@@ -8,6 +8,7 @@ the lookup bitmap is left intact, using only public interface methods.
 """
 
 # Standard
+from types import MappingProxyType
 import select
 import time
 
@@ -23,6 +24,9 @@ from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
+)
+from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
+    SerdeL2AdapterWrapper,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -90,6 +94,21 @@ def _make_adapter(rate: float = 0.0, seed: int = 0, gap_indices=(), gap_tail_rat
         gap_tail_ratios=tuple(gap_tail_ratios),
     )
     return wrapper, inner
+
+
+def test_transparent_wrappers_forward_restart_inventory() -> None:
+    key = _object_key(1)
+    expected = MappingProxyType({key: 128})
+    inner = MockL2Adapter(MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0))
+    inner.get_existing_key_sizes = lambda: expected  # type: ignore[method-assign]
+    fault = FaultInjectL2Adapter(inner, rate=0.0, seed=0, gap_indices=())
+    serde = object.__new__(SerdeL2AdapterWrapper)
+    serde._inner = inner
+    try:
+        assert fault.get_existing_key_sizes() is expected
+        assert serde.get_existing_key_sizes() is expected
+    finally:
+        fault.close()
 
 
 def _store_all(adapter, keys):

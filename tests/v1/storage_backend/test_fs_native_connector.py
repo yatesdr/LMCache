@@ -13,12 +13,20 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.config import EvictionConfig
+from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _object_key_to_filename,
+)
+from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+    FSNativeL2AdapterConfig,
 )
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
     _object_key_to_string,
+)
+from lmcache.v1.distributed.storage_controllers.eviction_controller import (
+    L2AdapterEvictionState,
 )
 
 
@@ -211,6 +219,67 @@ def test_sync_adapter_waits_for_compiled_fs_completion(tmp_path) -> None:
         assert adapter.get_reserved_store_bytes() == 0
         assert (tmp_path / _object_key_to_filename(keys[0])).read_bytes() == b"first"
         assert (tmp_path / _object_key_to_filename(keys[1])).read_bytes() == b"other"
+    finally:
+        adapter.close()
+
+
+def test_restart_restores_compiled_fs_usage_and_evicts_oldest(tmp_path) -> None:
+    """A new native adapter accounts and evicts files from an earlier process."""
+    LMCacheFSClient = _import_fs_client()
+    oldest = ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(1),
+        model_name="restart/model",
+        kv_rank=0,
+        cache_salt="tenant-a",
+    )
+    newest = ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(2),
+        model_name="restart/model",
+        kv_rank=0,
+        cache_salt="tenant-a",
+    )
+    objects: Any = [_BufferObj(b"old"), _BufferObj(b"newest")]
+    writer = NativeConnectorL2Adapter(LMCacheFSClient(str(tmp_path), 1))
+    try:
+        assert writer.store_objects_sync([oldest, newest], objects) == (True, 2, 9)
+    finally:
+        writer.close()
+
+    oldest_path = tmp_path / _object_key_to_filename(oldest)
+    newest_path = tmp_path / _object_key_to_filename(newest)
+    os.utime(oldest_path, ns=(1_000, 1_000))
+    os.utime(newest_path, ns=(2_000, 2_000))
+
+    adapter = create_l2_adapter(
+        FSNativeL2AdapterConfig(
+            base_path=str(tmp_path),
+            num_workers=1,
+            max_capacity_gb=10 / (1024**3),
+        )
+    )
+    try:
+        assert list(adapter.get_existing_key_sizes().items()) == [
+            (oldest, 3),
+            (newest, 6),
+        ]
+        usage = adapter.get_usage()
+        assert usage.total_bytes_used == 9
+        assert usage.bytes_by_cache_salt == {"tenant-a": 9}
+
+        state = L2AdapterEvictionState(
+            adapter_id=0,
+            adapter=adapter,
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+        )
+        actions = state.eviction_policy.get_eviction_actions(0.5)
+        assert len(actions) == 1
+        assert actions[0].keys == [oldest]
+
+        adapter.delete(actions[0].keys)
+        assert not oldest_path.exists()
+        assert newest_path.exists()
+        assert adapter.get_usage().total_bytes_used == 6
+        assert adapter.get_existing_key_sizes() == {newest: 6}
     finally:
         adapter.close()
 

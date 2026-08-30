@@ -23,7 +23,8 @@ from __future__ import annotations
 # Standard
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 import select
 import threading
 
@@ -125,8 +126,17 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         max_capacity_gb: float = 0,
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
+        initial_key_sizes: Mapping[ObjectKey, int] | None = None,
     ) -> None:
+        """Create an adapter around a native storage connector.
+
+        ``initial_key_sizes`` is a startup-only inventory supplied by a
+        persistent backend. It seeds both capacity accounting and delete-time
+        size tracking before the demultiplexer can process any completion.
+        """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
+        existing_key_sizes = dict(initial_key_sizes or {})
+        self._initialize_usage(existing_key_sizes)
         self._client = native_client
         self._client_fd: int = int(native_client.event_fd())
         self._type_name: str = type_name or type(native_client).__name__
@@ -171,7 +181,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # at delete time (the native completion only carries booleans, not
         # sizes) so we can pass them to ``_notify_keys_deleted``. Aggregate
         # and per-user totals live in the base class — see ``get_usage``.
-        self._key_sizes: dict[ObjectKey, int] = {}
+        self._key_sizes: dict[ObjectKey, int] = existing_key_sizes
         # Bridges store submission to demux completion for capacity settlement,
         # durable accounting, and native buffer lifetime ownership.
         self._pending_store_sizes: dict[int, _PendingStore] = {}
@@ -190,6 +200,11 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             name="l2-adapter-demux",
         )
         self._demux_thread.start()
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Return a detached, immutable native-resident key snapshot."""
+        with self._lock:
+            return MappingProxyType(dict(self._key_sizes))
 
     # ---------------------------------------------------------------
     # Event Fd Interface

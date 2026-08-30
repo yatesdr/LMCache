@@ -284,6 +284,35 @@ class TestStorageManagerRuntimeAdapters:
         finally:
             sm.close()
 
+    def test_add_seeds_eviction_before_request_controllers(
+        self, empty_storage_manager_config, monkeypatch
+    ):
+        """Runtime add cannot route work before restart inventory is seeded."""
+        sm = StorageManager(empty_storage_manager_config)
+        config = make_mock_config()
+        config.eviction_config = EvictionConfig(eviction_policy="LRU")
+        calls: list[str] = []
+        monkeypatch.setattr(
+            sm._l2_eviction_controller,
+            "add_adapter_state",
+            lambda _state: calls.append("eviction"),
+        )
+        monkeypatch.setattr(
+            sm._store_controller,
+            "add_adapter",
+            lambda *_args: calls.append("store"),
+        )
+        monkeypatch.setattr(
+            sm._prefetch_controller,
+            "add_adapter",
+            lambda *_args: calls.append("prefetch"),
+        )
+        try:
+            sm.add_l2_adapter(config)
+            assert calls == ["eviction", "store", "prefetch"]
+        finally:
+            sm.close()
+
     def test_add_then_store(self, empty_storage_manager_config):
         """Keys written after add_l2_adapter land in the new adapter."""
         sm = StorageManager(empty_storage_manager_config)

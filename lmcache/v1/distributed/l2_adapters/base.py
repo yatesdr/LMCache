@@ -31,6 +31,7 @@ L2TaskId = int
 
 
 _EMPTY_BY_CACHE_SALT: Mapping[str, int] = MappingProxyType({})
+_EMPTY_KEY_SIZES: Mapping[ObjectKey, int] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ class L2AdapterInterface(ABC):
         self._total_bytes_used: int = 0
         self._reserved_store_bytes: int = 0
         self._bytes_by_cache_salt: dict[str, int] = {}
+        self._usage_initialized: bool = False
         self._usage_lock = threading.Lock()
 
     #####################
@@ -654,6 +656,47 @@ class L2AdapterInterface(ABC):
                 # view is fully detached from the adapter's live state.
                 bytes_by_cache_salt=MappingProxyType(per_salt_snapshot),
             )
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Return a detached, immutable snapshot of resident keys and sizes.
+
+        Persistent adapters override this to let a newly constructed eviction
+        policy rebuild its key set after process restart. Iteration order should
+        be least-recently-used to most-recently-used when the backend can recover
+        that information. Adapters without a persistent inventory return an
+        empty mapping.
+        """
+        return _EMPTY_KEY_SIZES
+
+    def _initialize_usage(self, key_sizes: Mapping[ObjectKey, int]) -> None:
+        """Seed byte accounting before the adapter accepts operations.
+
+        This is deliberately separate from ``_notify_keys_stored``: restoring
+        persistent state must not emit synthetic runtime store events. It may be
+        called once, while the adapter is quiescent, and rejects invalid sizes or
+        previously initialized accounting.
+        """
+        total_bytes_used = 0
+        bytes_by_cache_salt: dict[str, int] = {}
+        for key, size in key_sizes.items():
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError("existing object sizes must be positive integers")
+            total_bytes_used += size
+            bytes_by_cache_salt[key.cache_salt] = (
+                bytes_by_cache_salt.get(key.cache_salt, 0) + size
+            )
+
+        with self._usage_lock:
+            if (
+                self._usage_initialized
+                or self._total_bytes_used
+                or self._reserved_store_bytes
+                or self._bytes_by_cache_salt
+            ):
+                raise RuntimeError("L2 adapter usage has already been initialized")
+            self._total_bytes_used = total_bytes_used
+            self._bytes_by_cache_salt = bytes_by_cache_salt
+            self._usage_initialized = True
 
     #####################
     # Cleanup Interface

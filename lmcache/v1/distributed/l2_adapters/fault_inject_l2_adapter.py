@@ -21,6 +21,7 @@ single-gap repros.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 import hashlib
 import threading
@@ -396,6 +397,10 @@ class FaultInjectL2Adapter(L2AdapterInterface):
     def get_usage(self) -> AdapterUsage:
         """Return the inner adapter's usage; this layer holds no data of its own."""
         return self._inner.get_usage()
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Forward the persistent inventory owned by the inner adapter."""
+        return self._inner.get_existing_key_sizes()
 
     @property
     def supports_global_eviction(self) -> bool:

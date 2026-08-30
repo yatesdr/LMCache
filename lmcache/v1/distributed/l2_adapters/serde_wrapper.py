@@ -30,6 +30,7 @@ invariants don't need to change.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import enum
 import select
@@ -310,6 +311,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
     def get_usage(self) -> AdapterUsage:
         return self._inner.get_usage()
+
+    def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
+        """Forward the persistent inventory owned by the inner adapter."""
+        return self._inner.get_existing_key_sizes()
 
     def delete(self, keys: list[ObjectKey]) -> None:
         self._inner.delete(keys)

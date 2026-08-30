@@ -25,7 +25,28 @@ I/O queue depth on a single Python thread.
   issuing a warm-up read of this many bytes at open time.  This is skipped
   for reads that use ``O_DIRECT`` because direct I/O bypasses the page cache.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
-  for client-side usage tracking.  Default ``0`` disables tracking.
+  for client-side usage enforcement and global eviction. Default ``0``
+  leaves capacity unlimited; resident-byte accounting remains available.
+
+Restart recovery
+----------------
+
+At construction, ``fs_native`` inventories complete ``.data`` files already
+present directly under ``base_path``. Their sizes seed capacity accounting and
+their modification times reconstruct a deterministic, best-effort LRU order
+(oldest first), so restart does not temporarily treat a populated cache as
+empty. This scan happens before request-serving controllers can use the adapter.
+
+Only positive-size regular files whose names decode with the current
+``ObjectKey`` filename format are restored. Temporary files, subdirectories,
+symlinks, unrecognized legacy/foreign names, and empty files are ignored; a
+bounded warning identifies ignored ``.data`` files. Missing files caused by a
+concurrent cleanup are tolerated, but other scan or stat errors fail startup to
+avoid silently undercounting capacity.
+
+For exact accounting, give one server exclusive ownership of ``base_path`` (or
+otherwise keep it quiescent) during startup. Modification time is only a restart
+ordering approximation; runtime accesses continue to update the normal LRU.
 
 .. important::
 

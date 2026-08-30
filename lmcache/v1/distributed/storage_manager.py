@@ -1025,8 +1025,6 @@ class StorageManager:
             with self._adapters_lock:
                 self._l2_adapters[adapter_id] = adapter
                 self._adapter_descriptors[adapter_id] = descriptor
-            self._store_controller.add_adapter(adapter_id, adapter, descriptor)
-            self._prefetch_controller.add_adapter(adapter_id, adapter, descriptor)
             if self._should_enable_l2_eviction(adapter, config.eviction_config):
                 assert config.eviction_config is not None  # make linter happy
                 self._l2_eviction_controller.add_adapter_state(
@@ -1036,6 +1034,11 @@ class StorageManager:
                         eviction_config=config.eviction_config,
                     )
                 )
+            # Expose the adapter to request-serving controllers only after its
+            # persistent inventory has seeded eviction state. This makes runtime
+            # add follow the same quiescent startup contract as initial adapters.
+            self._store_controller.add_adapter(adapter_id, adapter, descriptor)
+            self._prefetch_controller.add_adapter(adapter_id, adapter, descriptor)
             logger.info("Added L2 adapter %d (%s)", adapter_id, descriptor.type_name)
             self._publish_capacity_changed()
             return adapter_id

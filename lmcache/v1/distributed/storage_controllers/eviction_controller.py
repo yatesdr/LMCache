@@ -213,6 +213,12 @@ class L2AdapterEvictionState:
         self.eviction_policy = CreateEvictionPolicy(eviction_config)
         self.listener = L2EvictionPolicy(self.eviction_policy)
         adapter.register_listener(self.listener)
+        # StorageManager constructs this state before exposing the adapter to
+        # store/prefetch controllers. Seed one key at a time because normal
+        # store batches are token-ordered and LRU intentionally reverses them;
+        # the inventory itself is already ordered oldest to newest.
+        for key, size in adapter.get_existing_key_sizes().items():
+            self.listener.on_l2_keys_stored([key], [size])
 
 
 class L2EvictionController(StorageControllerInterface):

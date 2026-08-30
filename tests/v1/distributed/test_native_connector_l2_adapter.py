@@ -18,9 +18,13 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.config import EvictionConfig
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
     _object_key_to_string,
+)
+from lmcache.v1.distributed.storage_controllers.eviction_controller import (
+    L2AdapterEvictionState,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -1317,6 +1321,64 @@ class TestUsageTracking:
         usage = adapter_with_capacity.get_usage()
         assert usage.usage_fraction == 0.0
         assert usage.total_bytes_used == 0
+
+    def test_restart_inventory_seeds_usage_and_preserves_lru_order(self):
+        oldest = create_object_key(1)
+        newest = ObjectKey(
+            chunk_hash=ObjectKey.IntHash2Bytes(2),
+            model_name="test_model",
+            kv_rank=0,
+            cache_salt="tenant-a",
+        )
+        client = MockNativeConnector()
+        adapter = NativeConnectorL2Adapter(
+            client,
+            max_capacity_gb=1_000 / (1024**3),
+            initial_key_sizes={oldest: 300, newest: 400},
+        )
+        try:
+            usage = adapter.get_usage()
+            assert usage.total_bytes_used == 700
+            assert usage.usage_fraction == pytest.approx(0.7)
+            assert usage.bytes_by_cache_salt == {"": 300, "tenant-a": 400}
+
+            rejected = adapter.submit_store_task(
+                [create_object_key(3)], [create_memory_obj(size=100)]
+            )
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=1.0)
+            result = adapter.pop_completed_store_tasks()[rejected]
+            assert result.is_successful() is False
+            assert adapter.get_usage().total_bytes_used == 700
+
+            state = L2AdapterEvictionState(
+                adapter_id=0,
+                adapter=adapter,
+                eviction_config=EvictionConfig(
+                    eviction_policy="LRU",
+                    trigger_watermark=0.5,
+                    eviction_ratio=0.5,
+                ),
+            )
+            actions = state.eviction_policy.get_eviction_actions(0.5)
+            assert len(actions) == 1
+            assert actions[0].keys == [oldest]
+        finally:
+            adapter.close()
+
+    def test_restart_inventory_snapshot_is_immutable_and_detached(self):
+        key = create_object_key(1)
+        source = {key: 300}
+        adapter = NativeConnectorL2Adapter(
+            MockNativeConnector(), initial_key_sizes=source
+        )
+        try:
+            snapshot = adapter.get_existing_key_sizes()
+            source[key] = 999
+            assert snapshot == {key: 300}
+            with pytest.raises(TypeError):
+                snapshot[key] = 1  # type: ignore[index]
+        finally:
+            adapter.close()
 
     def test_get_usage_after_store(self, adapter_with_capacity):
         adp = adapter_with_capacity
