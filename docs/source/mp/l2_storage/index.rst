@@ -207,6 +207,10 @@ policy evicts a fraction of the least-recently-used keys.
      - disabled
      - Synchronously persist an eviction batch to a capable L2 adapter before
        deleting it from L1. Persistence failure preserves the L1 copy.
+   * - ``--periodic-flush-interval``
+     - ``0`` (disabled)
+     - Seconds between bounded backup scans below the L1 eviction watermark.
+       Backups add an L2 copy without deleting the L1 object.
 
 **Example:**
 
@@ -230,6 +234,21 @@ The option currently requires at least one configured L2 adapter that exposes
 the synchronous ``store_objects_sync()`` durability contract, such as the
 native filesystem adapter. Incompatible adapters are ignored and reported in
 the controller status and logs.
+
+Periodic Backup
+~~~~~~~~~~~~~~~
+
+``--periodic-flush-interval SECONDS`` independently enables bounded backup
+scans while L1 usage is below the eviction watermark. Each pass advances a
+rotating cursor through at most 128 currently evictable objects, persists one
+read-locked batch, and retains every L1 copy. It does not change ordinary L1
+eviction behavior; use ``--write-back-on-evict`` separately when capacity
+evictions must be durable.
+
+Periodic backup accepts only adapters whose ``store_objects_sync()`` contract
+supports a timeout. This bounds controller shutdown and runtime adapter
+replacement when an L2 backend is unhealthy. Missing, partial, timed-out, or
+failed backup stores leave L1 unchanged and are retried on a later scan.
 
 L2 Eviction
 ~~~~~~~~~~~

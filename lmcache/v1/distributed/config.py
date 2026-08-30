@@ -288,6 +288,11 @@ class EvictionConfig:
     deleting them. When enabled, missing or failed persistence keeps the L1
     objects resident instead of falling back to discard. """
 
+    periodic_flush_interval: float = field(default=0.0)
+    """ Seconds between bounded L1-to-L2 backup scans while below the
+    eviction watermark. Zero disables periodic backup. Backed-up objects stay
+    resident in L1. """
+
 
 @dataclass
 class StorageManagerConfig:
@@ -358,6 +363,9 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    if config.eviction_config.periodic_flush_interval < 0:
+        raise ValueError("periodic_flush_interval must be >= 0")
+
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -549,6 +557,13 @@ def add_storage_manager_args(
         help="Persist L1 eviction batches synchronously to L2 before deleting "
         "them. Requires an L2 adapter with store_objects_sync().",
     )
+    eviction_group.add_argument(
+        "--periodic-flush-interval",
+        type=float,
+        default=0.0,
+        help="Seconds between bounded L1-to-L2 backup scans while below the "
+        "eviction watermark (0 disables). Backups keep their L1 copy.",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -676,6 +691,7 @@ def parse_args_to_config(
         extra_logging_enabled=getattr(args, "enable_extra_logging", False),
         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
         write_back_on_evict=getattr(args, "write_back_on_evict", False),
+        periodic_flush_interval=getattr(args, "periodic_flush_interval", 0.0),
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

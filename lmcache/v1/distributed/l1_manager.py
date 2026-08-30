@@ -5,6 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
+from itertools import chain, islice
 from typing import Literal
 import threading
 
@@ -806,6 +807,48 @@ class L1Manager:
             len(keys_to_clear),
             locked_count,
         )
+
+    @l1_mgr_synchronized
+    def get_evictable_keys(
+        self,
+        limit: int,
+        cursor: int = 0,
+        scan_limit: int | None = None,
+    ) -> tuple[list[ObjectKey], int]:
+        """Return a bounded rotating batch of currently evictable keys.
+
+        The cursor is an insertion-order offset returned by the previous call.
+        A scan wraps at most once and examines no more than ``scan_limit``
+        entries, avoiding a full keyspace snapshot while the manager lock is
+        held. Concurrent insertion or deletion may shift the cursor; every
+        returned key is revalidated when the caller reserves it for reading.
+        """
+        if limit <= 0 or not self._objects:
+            return [], 0
+
+        object_count = len(self._objects)
+        start = cursor % object_count
+        max_scan = min(
+            object_count,
+            limit * 4 if scan_limit is None else max(0, scan_limit),
+        )
+        if max_scan == 0:
+            return [], start
+        ordered_keys = chain(
+            islice(self._objects, start, None),
+            islice(self._objects, 0, start),
+        )
+        keys: list[ObjectKey] = []
+        scanned = 0
+        for key in ordered_keys:
+            scanned += 1
+            if self.is_key_evictable(key):
+                keys.append(key)
+                if len(keys) >= limit:
+                    break
+            if scanned >= max_scan:
+                break
+        return keys, (start + scanned) % object_count
 
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).

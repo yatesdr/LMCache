@@ -437,6 +437,11 @@ Source: ``lmcache/v1/distributed/config.py``
        ``store_objects_sync()`` before deleting it from L1. Missing, partial,
        or failed persistence keeps the readable batch in L1. Disabled by
        default, preserving discard-on-evict behavior.
+   * - ``--periodic-flush-interval``
+     - ``0`` (disabled)
+     - Seconds between bounded L1-to-L2 backup scans while L1 remains below
+       the eviction watermark. Backed-up objects remain resident in L1. The
+       adapter must expose a timeout-capable ``store_objects_sync()`` method.
 
 L2 Policies
 -----------

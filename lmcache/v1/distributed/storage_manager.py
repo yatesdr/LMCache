@@ -169,13 +169,19 @@ class StorageManager:
         # Make adapters eligible for writeback only after their eviction state
         # and request-serving controllers are fully initialized.
         self._sync_l1_writeback_adapters()
-        if (
-            self._eviction_config.write_back_on_evict
-            and not self._eviction_controller.has_l2_flush_adapter()
+        if self._eviction_config.write_back_on_evict and not (
+            self._eviction_controller.has_l2_flush_adapter()
         ):
             logger.warning(
                 "write_back_on_evict is enabled but no L2 adapter exposes "
                 "store_objects_sync; L1 eviction will fail closed"
+            )
+        if self._eviction_config.periodic_flush_interval > 0 and not (
+            self._eviction_controller.has_periodic_flush_adapter()
+        ):
+            logger.warning(
+                "periodic_flush_interval is enabled but no L2 adapter exposes "
+                "a timeout-capable store_objects_sync; periodic backup is idle"
             )
 
         # L2 usage gauge — one observation per adapter, tagged by
@@ -1188,7 +1194,10 @@ class StorageManager:
 
     def _sync_l1_writeback_adapters(self) -> None:
         """Publish the active adapter set to the opt-in L1 writeback path."""
-        if not self._eviction_config.write_back_on_evict:
+        if not (
+            self._eviction_config.write_back_on_evict
+            or self._eviction_config.periodic_flush_interval > 0
+        ):
             return
         with self._adapters_lock:
             adapters = dict(self._l2_adapters)

@@ -135,12 +135,14 @@ def _controller(
     adapters: dict[int, object],
     *,
     enabled: bool = True,
+    periodic_flush_interval: float = 0.0,
 ) -> L1EvictionController:
     return L1EvictionController(
         l1_manager=manager,
         eviction_config=EvictionConfig(
             eviction_policy="LRU",
             write_back_on_evict=enabled,
+            periodic_flush_interval=periodic_flush_interval,
         ),
         l2_adapters=adapters,
     )
@@ -165,6 +167,41 @@ def test_writeback_cli_flag_is_plumbed() -> None:
     )
 
     assert parse_args_to_config(args).eviction_config.write_back_on_evict is True
+
+
+def test_periodic_backup_defaults_off_and_cli_is_plumbed() -> None:
+    assert EvictionConfig(eviction_policy="LRU").periodic_flush_interval == 0.0
+    parser = argparse.ArgumentParser()
+    add_storage_manager_args(parser)
+    add_observability_args(parser)
+    args = parser.parse_args(
+        [
+            "--l1-size-gb",
+            "1",
+            "--eviction-policy",
+            "LRU",
+            "--periodic-flush-interval",
+            "30.0",
+        ]
+    )
+
+    assert parse_args_to_config(args).eviction_config.periodic_flush_interval == 30.0
+
+
+def test_negative_periodic_backup_interval_is_rejected() -> None:
+    with pytest.raises(ValueError, match="periodic_flush_interval"):
+        StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=POOL_BYTES,
+                    use_lazy=False,
+                )
+            ),
+            eviction_config=EvictionConfig(
+                eviction_policy="LRU",
+                periodic_flush_interval=-1.0,
+            ),
+        )
 
 
 def test_disabled_controller_keeps_discard_behavior(l1_manager: L1Manager) -> None:
@@ -423,3 +460,201 @@ def test_storage_manager_wires_native_filesystem_writeback(tmp_path) -> None:
         assert all((tmp_path / _object_key_to_filename(key)).is_file() for key in keys)
     finally:
         manager.close()
+
+
+def test_storage_manager_wires_native_filesystem_periodic_backup(tmp_path) -> None:
+    pytest.importorskip("lmcache.lmcache_fs")
+    config = StorageManagerConfig(
+        l1_manager_config=L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=POOL_BYTES,
+                use_lazy=False,
+                init_size_in_bytes=POOL_BYTES,
+                align_bytes=0x1000,
+            )
+        ),
+        eviction_config=EvictionConfig(
+            eviction_policy="LRU",
+            periodic_flush_interval=30.0,
+        ),
+        l2_adapter_config=L2AdaptersConfig(
+            adapters=[
+                FSNativeL2AdapterConfig(
+                    base_path=str(tmp_path),
+                    num_workers=1,
+                    relative_tmp_dir="pending",
+                )
+            ]
+        ),
+    )
+    manager = StorageManager(config)
+    keys = _make_keys(2)
+    try:
+        assert manager._store_controller.request_remove_adapter(0).wait(timeout=5.0)
+        reserved = manager.reserve_write(keys, OBJECT_LAYOUT, mode="new")
+        assert list(reserved) == keys
+        manager._l1_manager.finish_write(keys)
+
+        manager._eviction_controller._backup_to_l2_no_delete(batch_limit=2)
+
+        assert manager._eviction_controller.has_periodic_flush_adapter() is True
+        assert _readable_keys(manager._l1_manager, keys) == keys
+        assert all((tmp_path / _object_key_to_filename(key)).is_file() for key in keys)
+    finally:
+        manager.close()
+
+
+def test_periodic_backup_keeps_l1_copy(l1_manager: L1Manager) -> None:
+    adapter = _SyncStoreAdapter()
+    controller = _controller(
+        l1_manager,
+        {0: adapter},
+        enabled=False,
+        periodic_flush_interval=30.0,
+    )
+    keys = _make_keys(3)
+    _store_keys(l1_manager, keys)
+
+    controller._backup_to_l2_no_delete(batch_limit=3)
+
+    assert adapter.stored_batches == [keys]
+    assert _readable_keys(l1_manager, keys) == keys
+
+
+def test_periodic_backup_rotates_a_bounded_scan(l1_manager: L1Manager) -> None:
+    keys = _make_keys(5)
+    _store_keys(l1_manager, keys)
+    assert l1_manager.reserve_read([keys[0]])[keys[0]][0] == L1Error.SUCCESS
+    try:
+        first, cursor = l1_manager.get_evictable_keys(
+            limit=2,
+            cursor=0,
+            scan_limit=2,
+        )
+        second, cursor = l1_manager.get_evictable_keys(
+            limit=2,
+            cursor=cursor,
+            scan_limit=2,
+        )
+        third, _ = l1_manager.get_evictable_keys(
+            limit=2,
+            cursor=cursor,
+            scan_limit=2,
+        )
+    finally:
+        l1_manager.finish_read([keys[0]])
+
+    assert first == [keys[1]]
+    assert second == keys[2:4]
+    assert third == [keys[4]]
+
+
+def test_periodic_backup_scan_limit_is_a_hard_bound(l1_manager: L1Manager) -> None:
+    keys = _make_keys(3)
+    _store_keys(l1_manager, keys)
+
+    batch, cursor = l1_manager.get_evictable_keys(
+        limit=3,
+        cursor=1,
+        scan_limit=0,
+    )
+
+    assert batch == []
+    assert cursor == 1
+
+
+def test_periodic_backup_cursor_visits_the_keyspace(l1_manager: L1Manager) -> None:
+    adapter = _SyncStoreAdapter()
+    controller = _controller(
+        l1_manager,
+        {0: adapter},
+        enabled=False,
+        periodic_flush_interval=30.0,
+    )
+    keys = _make_keys(6)
+    _store_keys(l1_manager, keys)
+
+    for _ in range(3):
+        controller._backup_to_l2_no_delete(batch_limit=2)
+
+    assert [len(batch) for batch in adapter.stored_batches] == [2, 2, 2]
+    assert {key for batch in adapter.stored_batches for key in batch} == set(keys)
+    assert _readable_keys(l1_manager, keys) == keys
+
+
+def test_periodic_backup_has_bounded_store_wait(l1_manager: L1Manager) -> None:
+    adapter = _BlockingSyncStoreAdapter()
+    controller = _controller(
+        l1_manager,
+        {0: adapter},
+        enabled=False,
+        periodic_flush_interval=30.0,
+    )
+    controller._PERIODIC_FLUSH_TIMEOUT_SECONDS = 0.05
+    keys = _make_keys(2)
+    _store_keys(l1_manager, keys)
+
+    start = time.monotonic()
+    controller._backup_to_l2_no_delete(batch_limit=2)
+    elapsed = time.monotonic() - start
+
+    assert adapter.entered.is_set()
+    assert elapsed < 0.5
+    assert _readable_keys(l1_manager, keys) == keys
+
+
+class _NoTimeoutSyncStoreAdapter:
+    def __init__(self) -> None:
+        self.stored_batches: list[list[ObjectKey]] = []
+
+    def store_objects_sync(
+        self,
+        keys: list[ObjectKey],
+        objects: list,
+    ) -> tuple[bool, int, int]:
+        self.stored_batches.append(list(keys))
+        return True, len(keys), sum(obj.get_size() for obj in objects)
+
+
+def test_periodic_backup_skips_adapter_without_timeout_contract(
+    l1_manager: L1Manager,
+) -> None:
+    adapter = _NoTimeoutSyncStoreAdapter()
+    controller = _controller(
+        l1_manager,
+        {0: adapter},
+        enabled=False,
+        periodic_flush_interval=30.0,
+    )
+    keys = _make_keys(2)
+    _store_keys(l1_manager, keys)
+
+    controller._backup_to_l2_no_delete(batch_limit=2)
+
+    assert controller.has_l2_flush_adapter() is True
+    assert controller.has_periodic_flush_adapter() is False
+    assert adapter.stored_batches == []
+    assert _readable_keys(l1_manager, keys) == keys
+
+
+def test_periodic_backup_loop_runs_below_watermark(l1_manager: L1Manager) -> None:
+    adapter = _SyncStoreAdapter()
+    controller = _controller(
+        l1_manager,
+        {0: adapter},
+        enabled=False,
+        periodic_flush_interval=0.01,
+    )
+    keys = _make_keys(2)
+    _store_keys(l1_manager, keys)
+
+    controller.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not adapter.stored_batches and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        controller.stop()
+
+    assert adapter.stored_batches
+    assert _readable_keys(l1_manager, keys) == keys

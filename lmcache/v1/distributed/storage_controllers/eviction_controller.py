@@ -8,6 +8,7 @@ from abc import abstractmethod
 from collections import Counter
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
+import inspect
 import threading
 import time
 
@@ -104,6 +105,8 @@ class L1EvictionController(EvictionController):
     """
 
     _SYNC_FLUSH_BATCH_SIZE = 128
+    _BACKUP_FLUSH_BATCH_SIZE = 128
+    _PERIODIC_FLUSH_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -121,7 +124,9 @@ class L1EvictionController(EvictionController):
         self._last_extra_log = time.monotonic()
 
         self._write_back_enabled = eviction_config.write_back_on_evict
+        self._periodic_backup_enabled = eviction_config.periodic_flush_interval > 0
         self._l2_flush_adapters: dict[int, _SyncStore] = {}
+        self._l2_adapter_supports_timeout: dict[int, bool] = {}
         self._l2_adapters_lock = threading.Lock()
         # Adapter replacement and synchronous persistence share this lock.
         # A runtime adapter removal can therefore wait for an active flush
@@ -129,6 +134,8 @@ class L1EvictionController(EvictionController):
         self._flush_lock = threading.Lock()
         self._sync_flush_failures = 0
         self._sync_flush_backoff_until = 0.0
+        self._last_backup_flush = time.monotonic()
+        self._backup_flush_cursor = 0
         if self._write_back_enabled:
             # Register the durable destination even when no adapter is
             # currently compatible. This is the fail-closed invariant: policy
@@ -145,39 +152,77 @@ class L1EvictionController(EvictionController):
         The replacement waits for an active flush, so callers may close any
         removed adapter immediately after this method returns.
         """
-        if not self._write_back_enabled:
+        if not (self._write_back_enabled or self._periodic_backup_enabled):
             with self._flush_lock:
                 with self._l2_adapters_lock:
                     self._l2_flush_adapters = {}
+                    self._l2_adapter_supports_timeout = {}
             return
         compatible: dict[int, _SyncStore] = {}
+        supports_timeout: dict[int, bool] = {}
         for adapter_id, adapter in l2_adapters.items():
             sync_store = getattr(adapter, "store_objects_sync", None)
             if callable(sync_store):
                 compatible[adapter_id] = sync_store
+                try:
+                    parameters = inspect.signature(sync_store).parameters.values()
+                    supports_timeout[adapter_id] = any(
+                        parameter.name == "timeout"
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    )
+                except (TypeError, ValueError):
+                    supports_timeout[adapter_id] = False
         ignored = sorted(set(l2_adapters) - set(compatible))
-        if ignored and self._write_back_enabled:
+        if ignored:
             logger.warning(
-                "L1 writeback ignored adapters without store_objects_sync: %s",
+                "L1 persistence ignored adapters without store_objects_sync: %s",
                 ignored,
             )
+        if self._periodic_backup_enabled:
+            unbounded = sorted(
+                adapter_id
+                for adapter_id in compatible
+                if not supports_timeout[adapter_id]
+            )
+            if unbounded:
+                logger.warning(
+                    "Periodic L2 backup ignored adapters without a timeout "
+                    "contract: %s",
+                    unbounded,
+                )
         with self._flush_lock:
             with self._l2_adapters_lock:
                 self._l2_flush_adapters = compatible
+                self._l2_adapter_supports_timeout = supports_timeout
 
     def _snapshot_l2_flush_adapters(self) -> list[tuple[int, _SyncStore]]:
         with self._l2_adapters_lock:
             return list(self._l2_flush_adapters.items())
+
+    def _snapshot_periodic_flush_adapters(self) -> list[tuple[int, _SyncStore]]:
+        """Return adapters whose sync-store contract accepts a timeout."""
+        with self._l2_adapters_lock:
+            return [
+                (adapter_id, sync_store)
+                for adapter_id, sync_store in self._l2_flush_adapters.items()
+                if self._l2_adapter_supports_timeout.get(adapter_id, False)
+            ]
 
     def remove_l2_adapter(self, adapter_id: int) -> None:
         """Stop writeback to one adapter and wait for its active flush."""
         with self._flush_lock:
             with self._l2_adapters_lock:
                 self._l2_flush_adapters.pop(adapter_id, None)
+                self._l2_adapter_supports_timeout.pop(adapter_id, None)
 
     def has_l2_flush_adapter(self) -> bool:
         """Return whether a synchronous durability path is available."""
         return bool(self._snapshot_l2_flush_adapters())
+
+    def has_periodic_flush_adapter(self) -> bool:
+        """Return whether a bounded periodic-backup path is available."""
+        return bool(self._snapshot_periodic_flush_adapters())
 
     def report_status(self) -> dict:
         adapters = self._snapshot_l2_flush_adapters()
@@ -188,6 +233,8 @@ class L1EvictionController(EvictionController):
             "trigger_watermark": self._eviction_config.trigger_watermark,
             "eviction_ratio": self._eviction_config.eviction_ratio,
             "write_back_enabled": self._write_back_enabled,
+            "periodic_flush_interval": (self._eviction_config.periodic_flush_interval),
+            "periodic_flush_enabled": self.has_periodic_flush_adapter(),
             "l2_flush_enabled": bool(adapters),
             "l2_flush_adapter_ids": [adapter_id for adapter_id, _ in adapters],
             "sync_flush_failures": self._sync_flush_failures,
@@ -239,14 +286,24 @@ class L1EvictionController(EvictionController):
     def eviction_loop(self):
         watermark = self._eviction_config.trigger_watermark
         eviction_ratio = self._eviction_config.eviction_ratio
+        backup_interval = self._eviction_config.periodic_flush_interval
 
         while not self._stop_flag.is_set():
-            time.sleep(1)
+            if self._stop_flag.wait(1):
+                break
             used_bytes, total_bytes = self._l1_manager.get_memory_usage()
             if self._eviction_config.extra_logging_enabled:
                 self._maybe_log_memory_usage(used_bytes, total_bytes)
             usage = 0 if total_bytes == 0 else used_bytes / total_bytes
             if usage < watermark:
+                now = time.monotonic()
+                if (
+                    backup_interval > 0
+                    and self._snapshot_periodic_flush_adapters()
+                    and now - self._last_backup_flush >= backup_interval
+                ):
+                    self._last_backup_flush = now
+                    self._backup_to_l2_no_delete(self._BACKUP_FLUSH_BATCH_SIZE)
                 logger.debug(
                     "L1 memory usage %.2f below watermark %.2f; skipping eviction.",
                     usage,
@@ -388,6 +445,71 @@ class L1EvictionController(EvictionController):
                 len(not_deleted),
             )
         return True
+
+    def _backup_to_l2_no_delete(self, batch_limit: int) -> None:
+        """Persist a bounded rotating L1 batch without deleting its L1 copy.
+
+        Periodic work accepts only adapters with an explicit timeout contract,
+        ensuring controller shutdown and runtime adapter replacement stay
+        bounded even when an L2 backend is unhealthy.
+        """
+        with self._flush_lock:
+            batch, self._backup_flush_cursor = self._l1_manager.get_evictable_keys(
+                limit=batch_limit,
+                cursor=self._backup_flush_cursor,
+            )
+            if not batch:
+                return
+
+            read_result = self._l1_manager.reserve_read(batch)
+            readable_keys: list[ObjectKey] = []
+            readable_objs = []
+            for key in batch:
+                entry = read_result.get(key)
+                if (
+                    entry is not None
+                    and entry[0] == L1Error.SUCCESS
+                    and entry[1] is not None
+                ):
+                    readable_keys.append(key)
+                    readable_objs.append(entry[1])
+
+            if not readable_keys:
+                return
+
+            try:
+                for adapter_id, sync_store in self._snapshot_periodic_flush_adapters():
+                    try:
+                        ok, persisted_count, bytes_written = sync_store(
+                            readable_keys,
+                            readable_objs,
+                            timeout=self._PERIODIC_FLUSH_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Periodic L2 backup: sync store failed on adapter %d",
+                            adapter_id,
+                        )
+                        continue
+                    if ok and persisted_count == len(readable_keys):
+                        logger.info(
+                            "Periodic L2 backup: persisted %d keys (%d bytes) "
+                            "via adapter %d; L1 copies retained",
+                            persisted_count,
+                            bytes_written,
+                            adapter_id,
+                        )
+                        break
+                    logger.warning(
+                        "Periodic L2 backup: adapter %d reported %d/%d durable "
+                        "keys (%d bytes); L1 copies retained",
+                        adapter_id,
+                        persisted_count,
+                        len(readable_keys),
+                        bytes_written,
+                    )
+            finally:
+                self._l1_manager.finish_read(readable_keys)
 
 
 class L2AdapterEvictionState:
