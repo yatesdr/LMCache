@@ -4,6 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
@@ -16,7 +17,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenGroupLayout,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -181,6 +185,75 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
             "engine-driven transfer does not support hybrid KV cache groups"
         )
     return block_ids[0]
+
+
+@dataclass(frozen=True)
+class _EngineDrivenWorkerGroup:
+    """Worker-local state for one protocol-visible LMCache object group."""
+
+    layout: EngineDrivenGroupLayout
+    layer_names: tuple[str, ...]
+    engine_kv_format: Any
+
+
+def _validate_group_block_ids(
+    groups: Sequence[_EngineDrivenWorkerGroup], block_ids: list[list[int]]
+) -> int:
+    """Validate group-major block IDs and return the common chunk count."""
+    if len(block_ids) != len(groups):
+        raise ValueError(
+            f"got {len(block_ids)} block-id lists for {len(groups)} "
+            "registered LMCache groups"
+        )
+    num_chunks: int | None = None
+    for group_idx, (group, ids) in enumerate(zip(groups, block_ids, strict=True)):
+        blocks_per_chunk = group.layout.blocks_per_chunk
+        if len(ids) % blocks_per_chunk:
+            raise ValueError(
+                f"group {group_idx} block-id count {len(ids)} is not divisible "
+                f"by blocks_per_chunk {blocks_per_chunk}"
+            )
+        group_chunks = len(ids) // blocks_per_chunk
+        if num_chunks is None:
+            num_chunks = group_chunks
+        elif group_chunks != num_chunks:
+            raise ValueError(
+                f"group {group_idx} covers {group_chunks} chunks; expected {num_chunks}"
+            )
+    return num_chunks or 0
+
+
+def _collapse_chunks_for_single_destination(
+    chunks: list[torch.Tensor],
+    block_ids: list[int],
+    blocks_per_chunk: int,
+    blocks_per_window: int,
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Keep only the newest recurrent snapshot when all chunks alias one slot."""
+    num_chunks = len(chunks)
+    if (
+        num_chunks <= 1
+        or blocks_per_chunk < 1
+        or blocks_per_window < 1
+        or blocks_per_window > blocks_per_chunk
+        or len(block_ids) != num_chunks * blocks_per_chunk
+    ):
+        return chunks, block_ids
+    destinations = [
+        tuple(
+            block_ids[
+                (idx + 1) * blocks_per_chunk - blocks_per_window : (idx + 1)
+                * blocks_per_chunk
+            ]
+        )
+        for idx in range(num_chunks)
+    ]
+    if not destinations[0] or any(
+        destination != destinations[0] for destination in destinations[1:]
+    ):
+        return chunks, block_ids
+    last_start = (num_chunks - 1) * blocks_per_chunk
+    return chunks[-1:], block_ids[last_start : last_start + blocks_per_chunk]
 
 
 def _get_kv_device(kv_caches: dict[str, torch.Tensor]) -> torch.device:
@@ -642,6 +715,109 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._worker_groups: tuple[_EngineDrivenWorkerGroup, ...] = ()
+
+    def _gather_group_payloads(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        out_buffers: list[list[torch.Tensor]] | None = None,
+        group_chunk_indices: list[list[int]] | None = None,
+    ) -> list[list[torch.Tensor]]:
+        """Gather every registered object group in protocol order."""
+        num_chunks = _validate_group_block_ids(self._worker_groups, block_ids)
+        if out_buffers is not None and len(out_buffers) != len(self._worker_groups):
+            raise ValueError("store buffers do not cover every registered group")
+        if group_chunk_indices is not None and len(group_chunk_indices) != len(
+            self._worker_groups
+        ):
+            raise ValueError("store chunk indices do not cover every registered group")
+
+        payloads: list[list[torch.Tensor]] = []
+        for group_idx, group in enumerate(self._worker_groups):
+            indices = (
+                group_chunk_indices[group_idx]
+                if group_chunk_indices is not None
+                else None
+            )
+            if indices is not None and any(
+                chunk_idx < 0 or chunk_idx >= num_chunks for chunk_idx in indices
+            ):
+                raise ValueError(f"group {group_idx} has invalid chunk indices")
+            payloads.append(
+                gather_paged_kv_to_cpu(
+                    {name: kv_caches[name] for name in group.layer_names},
+                    block_ids[group_idx],
+                    group.layout.blocks_per_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=group.engine_kv_format,
+                    out=(out_buffers[group_idx] if out_buffers is not None else None),
+                    chunk_indices=indices,
+                    blocks_per_window=group.layout.blocks_per_window,
+                )
+            )
+        return payloads
+
+    def _scatter_group_payloads(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        group_payloads: list[list[torch.Tensor]],
+        skip_first_n_tokens: int,
+    ) -> None:
+        """Validate all group payloads before scheduling any destination writes."""
+        num_chunks = _validate_group_block_ids(self._worker_groups, block_ids)
+        if len(group_payloads) != len(self._worker_groups):
+            raise ValueError("retrieve payload does not cover every registered group")
+
+        for group_idx, (group, payloads) in enumerate(
+            zip(self._worker_groups, group_payloads, strict=True)
+        ):
+            if len(payloads) != num_chunks:
+                raise ValueError(
+                    f"group {group_idx} returned {len(payloads)} chunks; "
+                    f"expected {num_chunks}"
+                )
+            expected_shape = torch.Size(group.layout.shape)
+            expected_dtype = getattr(torch, group.layout.dtype_str)
+            if any(
+                payload.shape != expected_shape or payload.dtype != expected_dtype
+                for payload in payloads
+            ):
+                raise ValueError(
+                    f"group {group_idx} retrieve payload does not match its "
+                    "registered layout"
+                )
+
+        for group_idx, (group, payloads) in enumerate(
+            zip(self._worker_groups, group_payloads, strict=True)
+        ):
+            group_block_ids = block_ids[group_idx]
+            if group.layout.group_kind == "recurrent" and skip_first_n_tokens == 0:
+                payloads, group_block_ids = _collapse_chunks_for_single_destination(
+                    payloads,
+                    group_block_ids,
+                    group.layout.blocks_per_chunk,
+                    group.layout.blocks_per_window,
+                )
+            physical_block_size = (
+                group.layout.shape[-2] // group.layout.blocks_per_window
+            )
+            physical_skip = (
+                skip_first_n_tokens
+                * physical_block_size
+                // group.layout.tokens_per_block
+            )
+            scatter_cpu_to_paged_kv(
+                {name: kv_caches[name] for name in group.layer_names},
+                group_block_ids,
+                payloads,
+                group.layout.blocks_per_chunk,
+                skip_first_n_tokens=physical_skip,
+                layout_hints=self._layout_hints,
+                engine_kv_format=group.engine_kv_format,
+                blocks_per_window=group.layout.blocks_per_window,
+            )
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -655,6 +831,34 @@ class EngineDrivenTransferContext(TransferContext):
                 "EngineDrivenTransferContext is not registered, call register() first."
             )
         return self._engine_driven_context
+
+    def _abort_store_safely(self, key: Any, instance_id: int) -> bool:
+        """Best-effort cancellation for a prepared store failure path."""
+        if self._engine_driven_context is None:
+            return False
+        try:
+            aborted = self._engine_driven_context.abort_store(key, instance_id)
+        except Exception:
+            logger.exception("Failed to abort engine-driven store reservations")
+            return False
+        if not aborted:
+            logger.warning("Engine-driven store reservation abort was not acknowledged")
+        return aborted
+
+    def _commit_retrieve_safely(self, key: Any, instance_id: int) -> bool:
+        """Best-effort release of server-side retrieve reservations."""
+        if self._engine_driven_context is None:
+            return False
+        try:
+            committed = self._engine_driven_context.commit_retrieve(key, instance_id)
+        except Exception:
+            logger.exception("Failed to release engine-driven retrieve reservations")
+            return False
+        if not committed:
+            logger.warning(
+                "Engine-driven retrieve reservation release was not acknowledged"
+            )
+        return committed
 
     def register(
         self,
@@ -670,18 +874,33 @@ class EngineDrivenTransferContext(TransferContext):
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
     ) -> None:
-        """Register KV caches with the non-GPU context server.
-
-        ``engine_group_infos`` and ``engine_type`` are accepted to satisfy
-        the base interface but are currently a no-op: the non-GPU transfer
-        path does not support hybrid KV cache groups and rejects multi-
-        group transfers at store / retrieve time (see
-        ``_single_group_block_ids``).
-        """
-        del engine_type  # unused on the engine-driven path
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
+        """Register a legacy single group or exact hybrid group layouts."""
+        del engine_type
+        layer_names = tuple(kv_caches)
+        if not layer_names:
+            raise ValueError("kv_caches is empty")
+        grouped = len(engine_group_infos) > 1
+        if grouped and any(info.extra_object_group_tag for info in engine_group_infos):
+            raise ValueError(
+                "engine-driven hybrid transfer does not support connector-private "
+                "standalone object groups"
+            )
+        layout_source = kv_caches
+        if grouped:
+            first_indices = tuple(engine_group_infos[0].layer_indices)
+            if not first_indices:
+                raise ValueError("engine-driven group 0 has no layers")
+            if any(idx < 0 or idx >= len(layer_names) for idx in first_indices):
+                raise ValueError("engine-driven group 0 has invalid layer indices")
+            try:
+                layout_source = {
+                    layer_names[idx]: kv_caches[layer_names[idx]]
+                    for idx in first_indices
+                }
+            except IndexError as exc:
+                raise ValueError(
+                    "engine-driven group 0 has invalid layer indices"
+                ) from exc
         (
             block_size,
             num_layers,
@@ -689,9 +908,115 @@ class EngineDrivenTransferContext(TransferContext):
             dtype_str,
             engine_kv_format,
             kv_size,
-        ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+        ) = compute_kv_layout(layout_source, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
+
+        group_layouts: tuple[EngineDrivenGroupLayout, ...] = ()
+        if grouped:
+            # This retains the legacy register() input contract for the
+            # foundation commit. A follow-up passes the explicit LMCache token
+            # chunk size so compressed/subpaged groups do not infer it here.
+            logical_chunk_tokens = blocks_in_chunk * block_size
+            seen_layers: set[int] = set()
+            worker_groups: list[_EngineDrivenWorkerGroup] = []
+            for object_group_id, info in enumerate(engine_group_infos):
+                indices = tuple(info.layer_indices)
+                if not indices:
+                    raise ValueError(
+                        f"engine-driven group {object_group_id} has no layers"
+                    )
+                if seen_layers.intersection(indices):
+                    raise ValueError("engine-driven groups contain duplicate layers")
+                if any(idx < 0 or idx >= len(layer_names) for idx in indices):
+                    raise ValueError(
+                        f"engine-driven group {object_group_id} has invalid layer "
+                        "indices"
+                    )
+                seen_layers.update(indices)
+                try:
+                    group_kv = {
+                        layer_names[idx]: kv_caches[layer_names[idx]] for idx in indices
+                    }
+                except IndexError as exc:
+                    raise ValueError(
+                        f"engine-driven group {object_group_id} has invalid layer "
+                        "indices"
+                    ) from exc
+                (
+                    physical_block_size,
+                    group_num_layers,
+                    group_hidden_dim,
+                    group_dtype_str,
+                    group_format,
+                    group_kv_size,
+                ) = compute_kv_layout(group_kv, layout_hints=layout_hints)
+                tokens_per_block = info.tokens_per_block or physical_block_size
+                if logical_chunk_tokens % tokens_per_block:
+                    raise ValueError(
+                        f"LMCache chunk size {logical_chunk_tokens} does not align "
+                        f"to group {object_group_id} tokens_per_block "
+                        f"{tokens_per_block}"
+                    )
+                group_blocks_per_chunk = logical_chunk_tokens // tokens_per_block
+                window_tokens = (
+                    logical_chunk_tokens
+                    if info.sw_size_tokens < 0
+                    or info.sw_size_tokens >= logical_chunk_tokens
+                    else info.sw_size_tokens
+                )
+                if window_tokens % tokens_per_block:
+                    raise ValueError(
+                        f"group {object_group_id} sliding window {window_tokens} "
+                        f"does not align to tokens_per_block {tokens_per_block}"
+                    )
+                blocks_per_window = window_tokens // tokens_per_block
+                physical_window_tokens = blocks_per_window * physical_block_size
+                group_shape = (
+                    (group_num_layers, physical_window_tokens, group_hidden_dim)
+                    if group_kv_size == 1
+                    else (
+                        2,
+                        group_num_layers,
+                        physical_window_tokens,
+                        group_hidden_dim,
+                    )
+                )
+                layout = EngineDrivenGroupLayout(
+                    object_group_id=object_group_id,
+                    engine_group_idx=info.engine_group_id,
+                    layer_indices=indices,
+                    tokens_per_block=tokens_per_block,
+                    blocks_per_chunk=group_blocks_per_chunk,
+                    shape=group_shape,
+                    dtype_str=group_dtype_str,
+                    blocks_per_window=blocks_per_window,
+                    group_kind="recurrent" if info.recurrent_state else "attention",
+                    num_chunks_in_window=(
+                        1
+                        if info.recurrent_state
+                        else (
+                            -1
+                            if info.sw_size_tokens < 0
+                            else max(
+                                1,
+                                (info.sw_size_tokens + logical_chunk_tokens - 1)
+                                // logical_chunk_tokens,
+                            )
+                        )
+                    ),
+                )
+                worker_groups.append(
+                    _EngineDrivenWorkerGroup(
+                        layout=layout,
+                        layer_names=tuple(layer_names[idx] for idx in indices),
+                        engine_kv_format=group_format,
+                    )
+                )
+            self._worker_groups = tuple(worker_groups)
+            group_layouts = tuple(group.layout for group in worker_groups)
+        else:
+            self._worker_groups = ()
 
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
@@ -719,6 +1044,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    group_layouts=group_layouts,
                 )
             ],
         )
@@ -728,11 +1054,30 @@ class EngineDrivenTransferContext(TransferContext):
         if isinstance(response, RegisterEngineDrivenContextResponse):
             shm_name = response.shm_name
             pool_size = response.pool_size
+        if grouped and not (
+            isinstance(response, RegisterEngineDrivenContextResponse)
+            and response.accepts_group_layouts
+        ):
+            self._worker_groups = ()
+            raise RuntimeError(
+                "LMCache server did not acknowledge engine-driven hybrid group "
+                "layouts; upgrade the server to avoid cache corruption"
+            )
+        if shm_name and not (
+            isinstance(response, RegisterEngineDrivenContextResponse)
+            and response.accepts_store_abort
+        ):
+            self._worker_groups = ()
+            raise RuntimeError(
+                "LMCache server does not support canceling failed SHM stores; "
+                "upgrade the server to avoid publishing partial cache objects"
+            )
 
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
+            group_layouts=group_layouts,
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
@@ -743,9 +1088,11 @@ class EngineDrivenTransferContext(TransferContext):
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
-            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
+            "Worker non-GPU transfer context registered "
+            "(instance_id=%d, mode=%s, groups=%d)",
             instance_id,
             supported_transfer_mode,
+            max(1, len(self._worker_groups)),
         )
 
     def submit_store(
@@ -764,27 +1111,84 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
-        torch_dev.synchronize()
-        result = self._engine_driven_context.prepare_store(key, instance_id)
-        out_buffers, chunk_indices = result if result is not None else (None, None)
-        # All chunks already in cache — nothing to gather or commit.
-        if chunk_indices is not None and len(chunk_indices) == 0:
-            future: MessagingFuture[bool] = MessagingFuture()
-            future.set_result(True)
-            return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
-        if out_buffers is not None:
-            # SHM path uses async device->CPU copies; complete them before commit.
+        if self._worker_groups:
             torch_dev.synchronize()
-        ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+            group_out_buffers: list[list[torch.Tensor]] | None = None
+            prepared = False
+            try:
+                group_result = self._engine_driven_context.prepare_store_grouped(
+                    key, instance_id
+                )
+                prepared = True
+                group_out_buffers, group_chunk_indices = (
+                    group_result if group_result is not None else (None, None)
+                )
+                if group_chunk_indices is not None and not any(group_chunk_indices):
+                    group_future: MessagingFuture[bool] = MessagingFuture()
+                    group_future.set_result(True)
+                    return group_future
+                cpu_groups = self._gather_group_payloads(
+                    kv_caches,
+                    block_ids,
+                    out_buffers=group_out_buffers,
+                    group_chunk_indices=group_chunk_indices,
+                )
+                if group_out_buffers is not None:
+                    torch_dev.synchronize()
+                ok = self._engine_driven_context.commit_store_grouped(
+                    key, instance_id, cpu_groups
+                )
+                if not ok:
+                    self._abort_store_safely(key, instance_id)
+            except Exception:
+                logger.exception("Failed to store engine-driven hybrid chunks")
+                if group_out_buffers is not None:
+                    # A failed gather can leave asynchronous writes targeting
+                    # SHM views. Drain them before the server frees the slots.
+                    torch_dev.synchronize()
+                if prepared:
+                    self._abort_store_safely(key, instance_id)
+                ok = False
+            group_future = MessagingFuture()
+            group_future.set_result(ok)
+            return group_future
+
+        torch_dev.synchronize()
+        out_buffers: list[torch.Tensor] | None = None
+        prepared = False
+        try:
+            legacy_result = self._engine_driven_context.prepare_store(key, instance_id)
+            prepared = True
+            out_buffers, chunk_indices = (
+                legacy_result if legacy_result is not None else (None, None)
+            )
+            # All chunks already in cache — nothing to gather or commit.
+            if chunk_indices is not None and len(chunk_indices) == 0:
+                future: MessagingFuture[bool] = MessagingFuture()
+                future.set_result(True)
+                return future
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+            if out_buffers is not None:
+                # SHM path uses async device->CPU copies; complete them before commit.
+                torch_dev.synchronize()
+            ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+            if not ok:
+                self._abort_store_safely(key, instance_id)
+        except Exception:
+            logger.exception("Failed to store engine-driven chunks")
+            if out_buffers is not None:
+                torch_dev.synchronize()
+            if prepared:
+                self._abort_store_safely(key, instance_id)
+            ok = False
 
         future = MessagingFuture()
         future.set_result(ok)
@@ -807,6 +1211,32 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        if self._worker_groups:
+            src_groups = self._engine_driven_context.prepare_retrieve_grouped(
+                key, instance_id
+            )
+            ok = src_groups is not None
+            if src_groups is not None:
+                try:
+                    self._scatter_group_payloads(
+                        kv_caches,
+                        block_ids,
+                        src_groups,
+                        skip_first_n_tokens,
+                    )
+                    torch_dev.synchronize()
+                except Exception:
+                    logger.exception(
+                        "Failed to scatter retrieved hybrid CPU context chunks"
+                    )
+                    ok = False
+                finally:
+                    if not self._commit_retrieve_safely(key, instance_id):
+                        ok = False
+            group_future: MessagingFuture[bool] = MessagingFuture()
+            group_future.set_result(ok)
+            return group_future
+
         src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
@@ -820,13 +1250,15 @@ class EngineDrivenTransferContext(TransferContext):
                     layout_hints=self._layout_hints,
                     engine_kv_format=self._engine_kv_format,
                 )
-            except (RuntimeError, ValueError, TypeError, IndexError):
+                # SHM path: ensure all device writes are complete before releasing
+                # the SHM slot (server may reuse it after commit_retrieve).
+                torch_dev.synchronize()
+            except Exception:
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
-            # SHM path: ensure all device writes are complete before releasing
-            # the SHM slot (server may immediately reuse it after commit_retrieve).
-            torch_dev.synchronize()
-        self._engine_driven_context.commit_retrieve(key, instance_id)
+            finally:
+                if not self._commit_retrieve_safely(key, instance_id):
+                    ok = False
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -836,6 +1268,7 @@ class EngineDrivenTransferContext(TransferContext):
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None
+        self._worker_groups = ()
 
     def flush_inflight_stores(self) -> None:
         pass

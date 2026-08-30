@@ -173,6 +173,21 @@ def _has_recurrent_cache(kv_cache_config: "KVCacheConfig | None") -> bool:
     )
 
 
+def _recurrent_safe_lookup_end(num_tokens: int, chunk_tokens: int) -> int:
+    """Exclude the chunk containing the prompt's final recurrent state.
+
+    vLLM always recomputes the final prompt token. Restoring a recurrent state
+    snapshot that already includes that token would apply it twice, so the
+    lookup may cover only complete chunks ending strictly before the final
+    token.
+    """
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    if num_tokens <= 0:
+        return 0
+    return ((num_tokens - 1) // chunk_tokens) * chunk_tokens
+
+
 def _should_suppress_mixed_recurrent_retrieve(
     has_recurrent_cache: bool,
     num_computed_tokens: int,
@@ -1042,9 +1057,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
+        lookup_token_ids = tracker.get_token_ids()
+        if self._has_recurrent_cache:
+            lookup_token_ids = lookup_token_ids[
+                : _recurrent_safe_lookup_end(
+                    len(lookup_token_ids),
+                    self.scheduler_adapter.lmcache_tokens_per_chunk,
+                )
+            ]
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=tracker.get_token_ids(),
+            token_ids=lookup_token_ids,
             cache_salt=tracker.cache_salt,
         )
 
@@ -1116,9 +1139,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         tracker = self._get_or_create_request_tracker(request)
+        lookup_token_ids = list(request.all_token_ids)
+        if self._has_recurrent_cache:
+            lookup_token_ids = lookup_token_ids[
+                : _recurrent_safe_lookup_end(
+                    len(lookup_token_ids),
+                    self.scheduler_adapter.lmcache_tokens_per_chunk,
+                )
+            ]
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=list(request.all_token_ids),
+            token_ids=lookup_token_ids,
             cache_salt=tracker.cache_salt,
         )
 

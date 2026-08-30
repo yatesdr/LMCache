@@ -15,7 +15,10 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    ENGINE_DRIVEN_ABORT_STORE_PAYLOAD,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context.base import (
@@ -184,12 +187,73 @@ class EngineDrivenContextShm(EngineDrivenContext):
         chunk_indices: list[int] = context["chunk_indices"]
         return self._build_slot_tensors(slots), chunk_indices
 
+    def prepare_store_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> tuple[list[list[torch.Tensor]], list[list[int]]] | None:
+        """Map flat SHM descriptors into group-major store buffers."""
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_STORE,
+            [key, instance_id],
+            get_response_class(RequestType.PREPARE_STORE),
+        )
+        if not future.wait(timeout=self.mq_timeout):
+            raise LMCacheTimeoutError(
+                f"PREPARE_STORE timed out for instance_id={instance_id} "
+                f"after {self.mq_timeout}s",
+                session_id=key.request_id,
+            )
+        response = future.result()
+        context = response.context if isinstance(response.context, dict) else {}
+        slots = context.get("slots")
+        group_ids = context.get("group_ids")
+        chunk_indices = context.get("chunk_indices")
+        if (
+            not isinstance(slots, list)
+            or not isinstance(group_ids, list)
+            or not isinstance(chunk_indices, list)
+        ):
+            return None
+        if not (len(slots) == len(group_ids) == len(chunk_indices)):
+            raise ValueError("grouped SHM store metadata lengths do not match")
+        group_count = len(self.metadata.effective_group_layouts)
+        out_buffers: list[list[torch.Tensor]] = [[] for _ in range(group_count)]
+        out_indices: list[list[int]] = [[] for _ in range(group_count)]
+        for tensor, group_id, chunk_idx in zip(
+            self._build_slot_tensors(slots), group_ids, chunk_indices, strict=True
+        ):
+            if not isinstance(group_id, int) or not 0 <= group_id < group_count:
+                raise ValueError(f"invalid grouped SHM object group id {group_id!r}")
+            out_buffers[group_id].append(tensor)
+            out_indices[group_id].append(int(chunk_idx))
+        return out_buffers, out_indices
+
     def commit_store(
         self, key: IPCCacheServerKey, instance_id: int, _chunks: list[torch.Tensor]
     ) -> bool:
         future = self.mq_client.submit_request(
             RequestType.COMMIT_STORE,
             [key, instance_id, b""],
+            get_response_class(RequestType.COMMIT_STORE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
+    def commit_store_grouped(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        _chunks: list[list[torch.Tensor]],
+    ) -> bool:
+        """Commit group-major SHM buffers already written in place."""
+        return self.commit_store(key, instance_id, [])
+
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Release prepared SHM objects without publishing partial data."""
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_STORE,
+            [key, instance_id, ENGINE_DRIVEN_ABORT_STORE_PAYLOAD],
             get_response_class(RequestType.COMMIT_STORE),
         )
         try:
@@ -213,6 +277,38 @@ class EngineDrivenContextShm(EngineDrivenContext):
             return None
         slots = response.context.get("slots", [])
         return self._build_slot_tensors(slots) if slots else None
+
+    def prepare_retrieve_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> list[list[torch.Tensor]] | None:
+        """Map flat SHM descriptors into group-major retrieve buffers."""
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_RETRIEVE,
+            [key, instance_id],
+            get_response_class(RequestType.PREPARE_RETRIEVE),
+        )
+        try:
+            response = future.result(timeout=self.mq_timeout)
+        except TimeoutError:
+            return None
+        if not response.success:
+            return None
+        context = response.context if isinstance(response.context, dict) else {}
+        slots = context.get("slots")
+        group_ids = context.get("group_ids")
+        if not isinstance(slots, list) or not isinstance(group_ids, list):
+            return None
+        if len(slots) != len(group_ids):
+            raise ValueError("grouped SHM retrieve metadata lengths do not match")
+        group_count = len(self.metadata.effective_group_layouts)
+        groups: list[list[torch.Tensor]] = [[] for _ in range(group_count)]
+        for tensor, group_id in zip(
+            self._build_slot_tensors(slots), group_ids, strict=True
+        ):
+            if not isinstance(group_id, int) or not 0 <= group_id < group_count:
+                raise ValueError(f"invalid grouped SHM object group id {group_id!r}")
+            groups[group_id].append(tensor)
+        return groups
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         future = self.mq_client.submit_request(

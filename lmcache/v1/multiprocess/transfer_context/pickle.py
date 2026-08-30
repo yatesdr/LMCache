@@ -2,6 +2,7 @@
 """Pickle-based EngineDrivenContext implementation for multiprocess mode."""
 
 # Standard
+from typing import cast
 import pickle
 
 # Third Party
@@ -71,6 +72,31 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def prepare_store_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> tuple[list[list[torch.Tensor]], list[list[int]]] | None:
+        """Run the pickle prepare handshake; no buffers are preallocated."""
+        self.prepare_store(key, instance_id)
+        return None
+
+    def commit_store_grouped(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[list[torch.Tensor]],
+    ) -> bool:
+        """Serialize a group-major hybrid payload."""
+        serialised = pickle.dumps(chunks)
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_STORE,
+            [key, instance_id, serialised],
+            get_response_class(RequestType.COMMIT_STORE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> list[torch.Tensor] | None:
@@ -92,6 +118,15 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             return None
         chunks: list[torch.Tensor] = pickle.loads(response.data)
         return chunks
+
+    def prepare_retrieve_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> list[list[torch.Tensor]] | None:
+        """Deserialize a group-major hybrid payload."""
+        return cast(
+            "list[list[torch.Tensor]] | None",
+            self.prepare_retrieve(key, instance_id),
+        )
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Send COMMIT_RETRIEVE (no-op for pickle path)."""

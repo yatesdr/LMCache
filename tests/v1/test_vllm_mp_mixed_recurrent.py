@@ -18,6 +18,7 @@ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     LMCacheMPRequestState,
     _has_recurrent_cache,
+    _recurrent_safe_lookup_end,
 )
 
 
@@ -46,6 +47,7 @@ class _SchedulerAdapter:
         self.cleaned_request_ids: list[str] = []
         self.freed_ranges: list[tuple[int, int, str]] = []
         self.ended_request_ids: list[str] = []
+        self.submitted_token_counts: list[int] = []
 
     def maybe_submit_lookup_request(
         self,
@@ -53,8 +55,9 @@ class _SchedulerAdapter:
         token_ids: list[int],
         cache_salt: str,
     ) -> None:
-        del request_id, token_ids, cache_salt
+        del request_id, cache_salt
         self.submit_count += 1
+        self.submitted_token_counts.append(len(token_ids))
 
     def check_lookup_result(self, request_id: str) -> int:
         del request_id
@@ -121,6 +124,44 @@ def test_recurrent_cache_detection_supports_old_and_new_vllm_configs(
     expected: bool,
 ) -> None:
     assert _has_recurrent_cache(config) is expected  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(0, 0), (1, 0), (3072, 0), (3073, 3072), (47963, 46080)],
+)
+def test_recurrent_safe_lookup_excludes_final_token_chunk(
+    num_tokens: int, expected: int
+) -> None:
+    assert _recurrent_safe_lookup_end(num_tokens, 3072) == expected
+
+
+def test_recurrent_lookup_submits_only_safe_prefix() -> None:
+    connector = _scheduler_connector(
+        has_recurrent_cache=True,
+        lookup_tokens=46080,
+    )
+    request = _Request("safe-recurrent", 47963)
+
+    connector.get_num_new_matched_tokens(request, 0)
+
+    adapter = connector.scheduler_adapter
+    assert isinstance(adapter, _SchedulerAdapter)
+    assert adapter.submitted_token_counts == [46080]
+
+
+def test_attention_lookup_keeps_full_prompt() -> None:
+    connector = _scheduler_connector(
+        has_recurrent_cache=False,
+        lookup_tokens=46080,
+    )
+    request = _Request("attention-control", 47963)
+
+    connector.get_num_new_matched_tokens(request, 0)
+
+    adapter = connector.scheduler_adapter
+    assert isinstance(adapter, _SchedulerAdapter)
+    assert adapter.submitted_token_counts == [47963]
 
 
 def _scheduler_connector(

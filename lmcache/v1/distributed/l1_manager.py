@@ -595,6 +595,43 @@ class L1Manager:
         return ret
 
     @l1_mgr_synchronized
+    def abort_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Discard newly reserved writes without making them readable.
+
+        This is the failure counterpart to :meth:`finish_write`. Only objects
+        that are still exclusively write-locked are removed; existing readable
+        objects and concurrently read objects fail closed.
+        """
+        ret: dict[ObjectKey, L1Error] = {}
+        aborted_keys: list[ObjectKey] = []
+        aborted_objs: list[MemoryObj] = []
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                ret[key] = L1Error.KEY_NOT_EXIST
+                continue
+            if not entry.write_lock.is_locked() or entry.read_lock.is_locked():
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
+            entry.write_lock.unlock()
+            aborted_keys.append(key)
+            aborted_objs.append(entry.memory_obj)
+            del self._objects[key]
+            ret[key] = L1Error.SUCCESS
+
+        aborted_meta = [self._object_meta(obj) for obj in aborted_objs]
+        self._memory_manager.free(aborted_objs)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(aborted_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": aborted_keys, "meta": aborted_meta},
+            )
+        )
+        return ret
+
+    @l1_mgr_synchronized
     def finish_write_and_reserve_read(
         self,
         keys: list[ObjectKey],

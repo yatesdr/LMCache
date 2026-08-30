@@ -1021,6 +1021,40 @@ class TestFinishWrite:
 
 
 # =============================================================================
+# Tests for L1Manager.abort_write()
+# =============================================================================
+
+
+class TestAbortWrite:
+    """Failed stores must discard only objects still reserved for writing."""
+
+    def test_abort_write_discards_reserved_object(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+        manager.reserve_write([key], [False], basic_layout)
+
+        result = manager.abort_write([key])
+
+        assert result[key] == L1Error.SUCCESS
+        assert manager.get_object_state(key) is None
+        manager.close()
+
+    def test_abort_write_preserves_finished_object(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+
+        result = manager.abort_write([key])
+
+        assert result[key] == L1Error.KEY_IN_WRONG_STATE
+        state = manager.get_object_state(key)
+        assert state is not None
+        assert state.available_for_read()
+        manager.close()
+
+
+# =============================================================================
 # Tests for L1Manager.finish_write_and_reserve_read()
 # =============================================================================
 

@@ -22,6 +22,10 @@ Key Types:
   - Converted to ObjectKey for storage operations via ipc_key_to_object_keys()
 """
 
+# COMMIT_STORE sentinel used to cancel SHM reservations after worker gather
+# failure without adding a new protocol opcode (and breaking older peers).
+ENGINE_DRIVEN_ABORT_STORE_PAYLOAD = b"lmcache-engine-driven-abort-v1"
+
 
 @dataclass(order=True, frozen=True)
 class IPCCacheServerKey:
@@ -145,6 +149,31 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class EngineDrivenGroupLayout(msgspec.Struct, frozen=True):
+    """Wire layout for one engine-driven object group.
+
+    The tuple order is the protocol-visible LMCache object-group order.  Each
+    group selects one already-expanded block-id list, owns a distinct storage
+    object sequence, and carries its exact physical per-chunk tensor shape.
+
+    ``blocks_per_chunk`` is the full logical chunk geometry.  A smaller
+    ``blocks_per_window`` means only the trailing physical window is stored in
+    ``shape``.  The default keeps payloads produced by the earlier community
+    overlay decodable.
+    """
+
+    object_group_id: int
+    engine_group_idx: int
+    layer_indices: tuple[int, ...]
+    tokens_per_block: int
+    blocks_per_chunk: int
+    shape: tuple[int, ...]
+    dtype_str: str
+    blocks_per_window: int = 0
+    group_kind: str = "attention"
+    num_chunks_in_window: int = -1
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -157,6 +186,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        group_layouts: Exact per-object-group layouts for an engine-driven
+            hybrid worker.  Empty preserves the legacy single-group protocol.
     """
 
     instance_id: int
@@ -167,6 +198,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    group_layouts: tuple[EngineDrivenGroupLayout, ...] = ()
 
 
 @dataclass

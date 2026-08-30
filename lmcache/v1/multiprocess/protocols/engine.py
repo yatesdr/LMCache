@@ -50,10 +50,16 @@ class PrepareRetrieveResponse:
 
 @dataclass
 class RegisterEngineDrivenContextResponse:
-    """Response for REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT."""
+    """Response for REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT.
+
+    Capability fields default off so newer workers can fail closed or retain
+    legacy behavior when an older server omits them from the wire response.
+    """
 
     shm_name: str = ""
     pool_size: int = 0
+    accepts_group_layouts: bool = False
+    accepts_store_abort: bool = False
 
 
 # Define request names for this protocol group

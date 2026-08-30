@@ -50,6 +50,9 @@ class _FakeStoreContext:
     ) -> bool:
         return bool(self.commit_impl(chunks))
 
+    def abort_store(self, _key: object, _instance_id: int) -> bool:
+        return True
+
     def close(self) -> None:
         return None
 

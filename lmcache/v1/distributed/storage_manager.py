@@ -261,6 +261,11 @@ class StorageManager:
 
         # TODO: global key states update
 
+    def abort_write(self, keys: list[ObjectKey]) -> None:
+        """Discard newly allocated write reservations after a failed copy."""
+        if keys:
+            self._l1_manager.abort_write(keys)
+
     @contextmanager
     def read_prefetched_results(
         self,
