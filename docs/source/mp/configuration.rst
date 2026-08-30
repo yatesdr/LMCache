@@ -431,6 +431,12 @@ Source: ``lmcache/v1/distributed/config.py``
    * - ``--eviction-ratio``
      - ``0.2``
      - Fraction of allocated memory to evict when triggered (0.0--1.0).
+   * - ``--write-back-on-evict``
+     - disabled
+     - Persist each L1 eviction batch through an L2 adapter exposing
+       ``store_objects_sync()`` before deleting it from L1. Missing, partial,
+       or failed persistence keeps the readable batch in L1. Disabled by
+       default, preserving discard-on-evict behavior.
 
 L2 Policies
 -----------

@@ -203,6 +203,10 @@ policy evicts a fraction of the least-recently-used keys.
    * - ``--eviction-ratio``
      - ``0.2``
      - Fraction of currently allocated L1 memory to evict per cycle.
+   * - ``--write-back-on-evict``
+     - disabled
+     - Synchronously persist an eviction batch to a capable L2 adapter before
+       deleting it from L1. Persistence failure preserves the L1 copy.
 
 **Example:**
 
@@ -210,7 +214,22 @@ policy evicts a fraction of the least-recently-used keys.
 
     --eviction-policy LRU \
     --eviction-trigger-watermark 0.8 \
-    --eviction-ratio 0.2
+    --eviction-ratio 0.2 \
+    --write-back-on-evict
+
+Without ``--write-back-on-evict``, L1 eviction keeps its existing discard
+behavior. With the option enabled, the policy always targets L2, including
+when no compatible adapter is available, so loss of the persistence path
+cannot silently degrade to discard. Objects are read-locked, persisted in
+bounded batches, unlocked, and deleted only when one adapter reports every
+readable object durable. Partial stores, exceptions, adapter removal, and
+concurrent locks preserve the affected L1 objects. Repeated failures use a
+bounded exponential backoff.
+
+The option currently requires at least one configured L2 adapter that exposes
+the synchronous ``store_objects_sync()`` durability contract, such as the
+native filesystem adapter. Incompatible adapters are ignored and reported in
+the controller status and logs.
 
 L2 Eviction
 ~~~~~~~~~~~

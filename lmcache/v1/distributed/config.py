@@ -283,6 +283,11 @@ class EvictionConfig:
     extra_logging_interval: float = field(default=10.0)
     """ Seconds between L1 memory usage log lines when extra logging is enabled. """
 
+    write_back_on_evict: bool = field(default=False)
+    """ Persist L1 eviction batches through a synchronous L2 adapter before
+    deleting them. When enabled, missing or failed persistence keeps the L1
+    objects resident instead of falling back to discard. """
+
 
 @dataclass
 class StorageManagerConfig:
@@ -538,6 +543,12 @@ def add_storage_manager_args(
         help="The fraction of memory to evict when triggered (0.0 to 1.0). "
         "Default is 0.2.",
     )
+    eviction_group.add_argument(
+        "--write-back-on-evict",
+        action="store_true",
+        help="Persist L1 eviction batches synchronously to L2 before deleting "
+        "them. Requires an L2 adapter with store_objects_sync().",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -664,6 +675,7 @@ def parse_args_to_config(
         eviction_ratio=args.eviction_ratio,
         extra_logging_enabled=getattr(args, "enable_extra_logging", False),
         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
+        write_back_on_evict=getattr(args, "write_back_on_evict", False),
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

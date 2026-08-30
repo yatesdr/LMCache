@@ -74,6 +74,7 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        self._eviction_config = config.eviction_config
         self._l1_manager = L1Manager(config.l1_manager_config)
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
@@ -164,6 +165,18 @@ class StorageManager:
             max_in_flight=config.prefetch_max_in_flight,
         )
         self._prefetch_controller.start()
+
+        # Make adapters eligible for writeback only after their eviction state
+        # and request-serving controllers are fully initialized.
+        self._sync_l1_writeback_adapters()
+        if (
+            self._eviction_config.write_back_on_evict
+            and not self._eviction_controller.has_l2_flush_adapter()
+        ):
+            logger.warning(
+                "write_back_on_evict is enabled but no L2 adapter exposes "
+                "store_objects_sync; L1 eviction will fail closed"
+            )
 
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -1036,6 +1049,7 @@ class StorageManager:
                         eviction_config=config.eviction_config,
                     )
                 )
+            self._sync_l1_writeback_adapters()
             logger.info("Added L2 adapter %d (%s)", adapter_id, descriptor.type_name)
             self._publish_capacity_changed()
             return adapter_id
@@ -1074,6 +1088,9 @@ class StorageManager:
                     f"Timed out draining adapter {adapter_id} from prefetch controller"
                 )
 
+            # Stop new writebacks and wait for any active synchronous flush
+            # before detaching eviction state or closing native resources.
+            self._eviction_controller.remove_l2_adapter(adapter_id)
             self._l2_eviction_controller.remove_adapter_state(adapter_id)
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
@@ -1168,6 +1185,14 @@ class StorageManager:
             True if memory is consistent, False otherwise.
         """
         return self._l1_manager.memcheck()
+
+    def _sync_l1_writeback_adapters(self) -> None:
+        """Publish the active adapter set to the opt-in L1 writeback path."""
+        if not self._eviction_config.write_back_on_evict:
+            return
+        with self._adapters_lock:
+            adapters = dict(self._l2_adapters)
+        self._eviction_controller.set_l2_adapters(adapters)
 
     def _snapshot_adapters(
         self,
