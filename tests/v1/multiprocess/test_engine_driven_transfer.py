@@ -756,6 +756,66 @@ def test_engine_driven_hybrid_registration_preserves_group_order_and_shapes(
     assert gathered_ids == [[10, 11], [20, 21, 22, 23]]
 
 
+def test_engine_driven_hybrid_registration_uses_explicit_chunk_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Physical page size cannot inflate a hybrid LMCache chunk."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    def _fake_layout(
+        caches: dict[str, torch.Tensor], **_kwargs: Any
+    ) -> tuple[int, int, int, str, Any, int]:
+        block_size = 8 if "layer_0" in caches else 1
+        return (
+            block_size,
+            1,
+            4,
+            "float32",
+            lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
+            1,
+        )
+
+    monkeypatch.setattr(worker_transfer, "compute_kv_layout", _fake_layout)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        MagicMock(return_value=MagicMock()),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        accepts_group_layouts=True
+    )
+    send_request = MagicMock(return_value=future)
+
+    EngineDrivenTransferContext().register(
+        instance_id=1,
+        kv_caches={
+            "layer_0": torch.zeros(4, 8, 4),
+            "layer_1": torch.zeros(4, 1, 4),
+        },
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=8,
+        tokens_per_chunk=8,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=(
+            EngineGroupInfo(0, (0,), tokens_per_block=8),
+            EngineGroupInfo(1, (1,), tokens_per_block=8),
+        ),
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert [group.blocks_per_chunk for group in payload.group_layouts] == [1, 1]
+    assert [group.shape[-2] for group in payload.group_layouts] == [8, 1]
+
+
 @pytest.mark.musa
 def test_musa_data_context_store_uses_device_agnostic_gather(
     monkeypatch: pytest.MonkeyPatch,

@@ -296,6 +296,7 @@ class TransferContext(ABC):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -315,6 +316,9 @@ class TransferContext(ABC):
                 own :class:`EngineType` so this transport stays engine-
                 neutral. Defaults to :attr:`EngineType.VLLM` for
                 backwards compatibility.
+            tokens_per_chunk: Explicit logical token span of one LMCache
+                chunk. Engine-driven hybrid transfer uses this instead of
+                inferring logical geometry from a physical cache tensor.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -498,6 +502,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tokens_per_chunk: int | None = None,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -513,11 +518,14 @@ class LMCacheDrivenTransferContext(TransferContext):
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata.
             engine_type: Serving engine that produced the caches.
+            tokens_per_chunk: Logical LMCache chunk size (unused by the
+                device-handle transfer path).
 
         Raises:
             RuntimeError: If event IPC is unsupported for the KV-cache device.
             ValueError: If ``kv_caches`` is empty.
         """
+        del tokens_per_chunk
         device = _get_kv_device(kv_caches)
         event_backend = get_event_ipc_backend(device)
         event_backend.check_event_support(device)
@@ -873,6 +881,7 @@ class EngineDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tokens_per_chunk: int | None = None,
     ) -> None:
         """Register a legacy single group or exact hybrid group layouts."""
         del engine_type
@@ -914,10 +923,13 @@ class EngineDrivenTransferContext(TransferContext):
 
         group_layouts: tuple[EngineDrivenGroupLayout, ...] = ()
         if grouped:
-            # This retains the legacy register() input contract for the
-            # foundation commit. A follow-up passes the explicit LMCache token
-            # chunk size so compressed/subpaged groups do not infer it here.
-            logical_chunk_tokens = blocks_in_chunk * block_size
+            logical_chunk_tokens = (
+                tokens_per_chunk
+                if tokens_per_chunk is not None
+                else blocks_in_chunk * block_size
+            )
+            if logical_chunk_tokens <= 0:
+                raise ValueError("tokens_per_chunk must be positive")
             seen_layers: set[int] = set()
             worker_groups: list[_EngineDrivenWorkerGroup] = []
             for object_group_id, info in enumerate(engine_group_infos):
