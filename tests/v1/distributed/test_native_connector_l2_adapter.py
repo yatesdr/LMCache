@@ -1508,12 +1508,14 @@ class TestStoreObjectsSync:
 
             assert result == (False, 0, 0)
             assert adapter.get_reserved_store_bytes() == obj.get_size()
+            assert adapter.has_inflight_store_for_keys([create_object_key(1)])
             with adapter._lock:
                 pending = next(iter(adapter._pending_store_sizes.values()))
                 assert pending.buffer_owners == [obj]
 
             mock_client.complete_suppressed_sets()
             assert _wait_until(lambda: adapter.get_reserved_store_bytes() == 0)
+            assert not adapter.has_inflight_store_for_keys([create_object_key(1)])
             assert adapter.get_usage().total_bytes_used == obj.get_size()
             assert adapter._pending_store_sizes == {}
         finally:

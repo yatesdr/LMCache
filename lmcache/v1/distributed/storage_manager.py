@@ -183,6 +183,14 @@ class StorageManager:
                 "periodic_flush_interval is enabled but no L2 adapter exposes "
                 "a timeout-capable store_objects_sync; periodic backup is idle"
             )
+        if self._eviction_config.emergency_evict_for_prefetch and not (
+            self._eviction_controller.has_bounded_l2_flush_adapter()
+        ):
+            logger.warning(
+                "emergency_evict_for_prefetch is enabled but no L2 adapter "
+                "exposes a timeout-capable store_objects_sync; emergency "
+                "eviction is disabled"
+            )
 
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -1101,6 +1109,7 @@ class StorageManager:
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
+            self._sync_l1_writeback_adapters()
             adapter.close()
             logger.info("Deleted L2 adapter %d", adapter_id)
             self._publish_capacity_changed()
@@ -1202,6 +1211,12 @@ class StorageManager:
         with self._adapters_lock:
             adapters = dict(self._l2_adapters)
         self._eviction_controller.set_l2_adapters(adapters)
+        if self._eviction_config.emergency_evict_for_prefetch:
+            self._prefetch_controller.set_l1_eviction_controller(
+                self._eviction_controller
+                if self._eviction_controller.has_bounded_l2_flush_adapter()
+                else None
+            )
 
     def _snapshot_adapters(
         self,

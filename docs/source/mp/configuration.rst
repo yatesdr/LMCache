@@ -442,6 +442,11 @@ Source: ``lmcache/v1/distributed/config.py``
      - Seconds between bounded L1-to-L2 backup scans while L1 remains below
        the eviction watermark. Backed-up objects remain resident in L1. The
        adapter must expose a timeout-capable ``store_objects_sync()`` method.
+   * - ``--emergency-evict-for-prefetch``
+     - disabled
+     - Allow a non-warm L2-to-L1 prefetch to make room synchronously by
+       evicting LRU objects through the fail-closed writeback path. Requires
+       ``--write-back-on-evict`` and a timeout-capable synchronous L2 adapter.
 
 L2 Policies
 -----------

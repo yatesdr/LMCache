@@ -293,6 +293,10 @@ class EvictionConfig:
     eviction watermark. Zero disables periodic backup. Backed-up objects stay
     resident in L1. """
 
+    emergency_evict_for_prefetch: bool = field(default=False)
+    """ Allow non-warm L2 prefetches to synchronously make room in L1 by
+    evicting LRU objects through the fail-closed writeback path. """
+
 
 @dataclass
 class StorageManagerConfig:
@@ -365,6 +369,11 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
     """
     if config.eviction_config.periodic_flush_interval < 0:
         raise ValueError("periodic_flush_interval must be >= 0")
+    if (
+        config.eviction_config.emergency_evict_for_prefetch
+        and not config.eviction_config.write_back_on_evict
+    ):
+        raise ValueError("emergency_evict_for_prefetch requires write_back_on_evict")
 
     if (
         config.l1_manager_config.gds_l1_config is not None
@@ -564,6 +573,12 @@ def add_storage_manager_args(
         help="Seconds between bounded L1-to-L2 backup scans while below the "
         "eviction watermark (0 disables). Backups keep their L1 copy.",
     )
+    eviction_group.add_argument(
+        "--emergency-evict-for-prefetch",
+        action="store_true",
+        help="Allow non-warm L2 prefetches to make room in L1 by evicting "
+        "LRU objects through --write-back-on-evict.",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -692,6 +707,9 @@ def parse_args_to_config(
         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
         write_back_on_evict=getattr(args, "write_back_on_evict", False),
         periodic_flush_interval=getattr(args, "periodic_flush_interval", 0.0),
+        emergency_evict_for_prefetch=getattr(
+            args, "emergency_evict_for_prefetch", False
+        ),
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

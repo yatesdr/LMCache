@@ -211,6 +211,10 @@ policy evicts a fraction of the least-recently-used keys.
      - ``0`` (disabled)
      - Seconds between bounded backup scans below the L1 eviction watermark.
        Backups add an L2 copy without deleting the L1 object.
+   * - ``--emergency-evict-for-prefetch``
+     - disabled
+     - Permit non-warm L2 restores to make room by synchronously writing back
+       and evicting LRU objects. Requires ``--write-back-on-evict``.
 
 **Example:**
 
@@ -249,6 +253,26 @@ Periodic backup accepts only adapters whose ``store_objects_sync()`` contract
 supports a timeout. This bounds controller shutdown and runtime adapter
 replacement when an L2 backend is unhealthy. Missing, partial, timed-out, or
 failed backup stores leave L1 unchanged and are retried on a later scan.
+
+Emergency Prefetch Pressure
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--emergency-evict-for-prefetch`` lets a non-warm L2 restore request bounded
+L1 space before allocation and retry only its out-of-memory reservations once.
+Victims follow the normal LRU order and are deleted only after complete L2
+durability. Hybrid restores calculate the request from each object group's own
+layout rather than assuming that every group has the first group's size.
+With ``IsolatedLRU``, emergency victims are restricted to the restoring
+request's ``cache_salt``; a missing salt fails closed without eviction.
+
+The synchronous eviction is capped at 60 percent of total L1 capacity for one
+restore and has a one-second persistence deadline. Deadline exhaustion keeps
+the remaining L1 objects and does not trip the normal backend-failure circuit
+breaker. Native buffers from a timed-out store remain ineligible for eviction
+until that store completes, preventing allocator reuse while the backend may
+still read them. Warm-up requests never evict other sessions. Runtime adapter removal
+disconnects the emergency path before closing the last bounded synchronous
+backend, and a later compatible adapter reconnects it.
 
 L2 Eviction
 ~~~~~~~~~~~

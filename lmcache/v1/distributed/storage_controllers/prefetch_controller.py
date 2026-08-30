@@ -45,6 +45,9 @@ retained keys (L1Manager.touch_keys), the ones the request actually
 serves.
 """
 
+# Future
+from __future__ import annotations
+
 # Standard
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -58,6 +61,7 @@ import threading
 # First Party
 from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
+from lmcache.utils import get_size_bytes
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
     AttnWindowDesc,
@@ -92,6 +96,9 @@ from lmcache.v1.platform import (
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.distributed.storage_controllers.eviction_controller import (
+        L1EvictionController,
+    )
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
@@ -293,6 +300,7 @@ class PrefetchController(StorageControllerInterface):
         }
         self._policy = policy
         self._max_in_flight = max_in_flight
+        self._l1_eviction_controller: L1EvictionController | None = None
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -1067,20 +1075,23 @@ class PrefetchController(StorageControllerInterface):
             )
         retention_map = dict(zip(keys_to_reserve, retentions, strict=True))
 
+        if request.mode is not PrefetchMode.WARM:
+            self._make_room_for_restore(request, keys_to_reserve)
+
         # Batch reserve_write by object_group_id so each group uses its own
         # tensor shapes.
-        write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
-        by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
-        for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
-            group_keys = list(group_iter)
-            gld = request.group_layout_descs[gid]
-            gr = self._l1_manager.reserve_write(
-                keys=group_keys,
-                is_temporary=[not retention_map[k] for k in group_keys],
-                layout_desc=gld,
-                mode="new",
+        write_results = self._reserve_grouped_buffers(
+            request,
+            keys_to_reserve,
+            retention_map,
+        )
+        if request.mode is not PrefetchMode.WARM:
+            write_results = self._retry_oom_reservations(
+                request,
+                keys_to_reserve,
+                retention_map,
+                write_results,
             )
-            write_results.update(gr)
 
         reserved: set[ObjectKey] = set()
         oom_keys: list[ObjectKey] = []
@@ -1125,6 +1136,132 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
         return reserved
+
+    def set_l1_eviction_controller(
+        self,
+        controller: "L1EvictionController | None",
+    ) -> None:
+        """Connect the bounded durable eviction path used by large restores."""
+        self._l1_eviction_controller = controller
+
+    _EMERGENCY_EVICT_MAX_L1_FRACTION = 0.6
+    _PER_OBJECT_HEADROOM_BYTES = 8192
+
+    def _restore_bytes(
+        self,
+        request: InFlightPrefetchRequest,
+        keys: list[ObjectKey],
+    ) -> int:
+        """Estimate allocator bytes using each object's current group layout."""
+        return sum(
+            get_size_bytes(
+                request.group_layout_descs[key.object_group_id].shapes,
+                request.group_layout_descs[key.object_group_id].dtypes,
+            )
+            + self._PER_OBJECT_HEADROOM_BYTES
+            for key in keys
+        )
+
+    def _make_room_for_restore(
+        self,
+        request: InFlightPrefetchRequest,
+        keys_to_reserve: list[ObjectKey],
+    ) -> None:
+        """Make bounded L1 room before a non-warm L2 restore."""
+        evictor = self._l1_eviction_controller
+        if evictor is None or request.mode is PrefetchMode.WARM or not keys_to_reserve:
+            return
+        used, total = self._l1_manager.get_memory_usage()
+        target_free = min(
+            self._restore_bytes(request, keys_to_reserve),
+            int(total * self._EMERGENCY_EVICT_MAX_L1_FRACTION),
+        )
+        if max(0, total - used) >= target_free:
+            return
+        for cache_salt in dict.fromkeys(key.cache_salt for key in keys_to_reserve):
+            try:
+                free = evictor.emergency_evict_bytes(
+                    target_free,
+                    requester=f"prefetch_request={request.request_id}",
+                    cache_salt=cache_salt,
+                )
+                if free >= target_free:
+                    break
+            except Exception:
+                logger.exception(
+                    "Emergency eviction failed for prefetch request %d "
+                    "and cache_salt %r",
+                    request.request_id,
+                    cache_salt,
+                )
+
+    def _reserve_grouped_buffers(
+        self,
+        request: InFlightPrefetchRequest,
+        keys: list[ObjectKey],
+        retention_map: dict[ObjectKey, bool],
+    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
+        """Reserve heterogeneous object groups with their own layouts."""
+        results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
+        by_group = sorted(keys, key=attrgetter("object_group_id"))
+        for group_id, group_iter in groupby(
+            by_group,
+            key=attrgetter("object_group_id"),
+        ):
+            group_keys = list(group_iter)
+            results.update(
+                self._l1_manager.reserve_write(
+                    keys=group_keys,
+                    is_temporary=[not retention_map[key] for key in group_keys],
+                    layout_desc=request.group_layout_descs[group_id],
+                    mode="new",
+                )
+            )
+        return results
+
+    def _retry_oom_reservations(
+        self,
+        request: InFlightPrefetchRequest,
+        keys: list[ObjectKey],
+        retention_map: dict[ObjectKey, bool],
+        write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]],
+    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
+        """Retry only OOM keys once after bounded durable eviction."""
+        if self._l1_eviction_controller is None:
+            return write_results
+        oom_keys = [
+            key
+            for key in keys
+            if (entry := write_results.get(key)) is None
+            or entry[0] == L1Error.OUT_OF_MEMORY
+            or (entry[0] == L1Error.SUCCESS and entry[1] is None)
+        ]
+        if not oom_keys:
+            return write_results
+
+        self._make_room_for_restore(request, oom_keys)
+        retry_results = self._reserve_grouped_buffers(
+            request,
+            oom_keys,
+            retention_map,
+        )
+        recovered = sum(
+            1
+            for key in oom_keys
+            if retry_results.get(key, (L1Error.OUT_OF_MEMORY, None))[0]
+            == L1Error.SUCCESS
+            and retry_results[key][1] is not None
+        )
+        if recovered:
+            logger.info(
+                "Retry recovered %d/%d OOM reservations for prefetch request %d",
+                recovered,
+                len(oom_keys),
+                request.request_id,
+            )
+        merged = dict(write_results)
+        merged.update(retry_results)
+        return merged
 
     def _submit_load_tasks(
         self,

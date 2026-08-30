@@ -909,6 +909,11 @@ class L1Manager:
                 break
         return keys, (start + scanned) % object_count
 
+    @l1_mgr_synchronized
+    def num_objects(self) -> int:
+        """Return the number of objects currently tracked in L1."""
+        return len(self._objects)
+
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).
 
