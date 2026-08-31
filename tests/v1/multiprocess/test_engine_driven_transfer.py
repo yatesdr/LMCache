@@ -2,15 +2,15 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
 import pickle
 import sys
 
 # Third Party
-import pytest
 import msgspec
+import pytest
 import torch
 
 # First Party
@@ -335,8 +335,9 @@ def test_engine_driven_registration_response_is_wire_compatible() -> None:
         )
     )
     legacy = msgspec.msgpack.decode(current_wire, type=legacy_type)
-    assert legacy.shm_name == "pool"
-    assert legacy.pool_size == 8
+    legacy_any = cast(Any, legacy)
+    assert legacy_any.shm_name == "pool"
+    assert legacy_any.pool_size == 8
 
 
 def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
@@ -1574,10 +1575,10 @@ def test_server_pickle_roundtrip_requires_every_hybrid_group(
         "g1": torch.zeros(1, 2, 8),
     }
     memory_objs = {}
-    for key, tensor in group_tensors.items():
+    for object_key, tensor in group_tensors.items():
         memory_obj = MagicMock()
         memory_obj.tensor = tensor
-        memory_objs[key] = memory_obj
+        memory_objs[object_key] = memory_obj
 
     def _reserve(keys: list[str], *_args: Any) -> dict[str, Any]:
         return {key: memory_objs[key] for key in keys}
@@ -1590,7 +1591,7 @@ def test_server_pickle_roundtrip_requires_every_hybrid_group(
     mock_storage.read_prefetched_results.side_effect = _read
     module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
     module.register_kv_cache_engine_driven_context(_grouped_register_payload())
-    ctx.resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
     source = [
         [torch.ones_like(group_tensors["g0"])],
         [torch.full_like(group_tensors["g1"], 2.0)],
@@ -1617,7 +1618,7 @@ def test_server_pickle_rejects_invalid_group_before_reserving(
     mock_storage = MagicMock()
     module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
     module.register_kv_cache_engine_driven_context(_grouped_register_payload())
-    ctx.resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
     invalid = [
         [torch.zeros(1)],
         [torch.zeros(1, 2, 8)],
@@ -1643,7 +1644,7 @@ def test_server_pickle_aborts_every_reservation_when_copy_fails(
     mock_storage.reserve_write.return_value = {"g0": memory_obj}
     module, _, _, ctx = server_module_factory(chunk_size=8, mock_storage=mock_storage)
     module.register_kv_cache_engine_driven_context(_grouped_register_payload())
-    ctx.resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
     source = [
         [torch.zeros(2, 1, 8, 16)],
         [torch.zeros(1, 2, 8)],
@@ -2087,7 +2088,7 @@ def test_server_grouped_shm_labels_slots_and_releases_all_group_miss(
         mock_storage=mock_storage,
     )
     module.register_kv_cache_engine_driven_context(_grouped_register_payload())
-    ctx.resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
     key = _default_key()
 
     response = module.prepare_store(key, 20)
@@ -2131,7 +2132,7 @@ def test_server_grouped_shm_abort_discards_pending_reservations(
         mock_storage=mock_storage,
     )
     module.register_kv_cache_engine_driven_context(_grouped_register_payload())
-    ctx.resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
     key = _default_key()
 
     assert module.prepare_store(key, 20).context["slots"]

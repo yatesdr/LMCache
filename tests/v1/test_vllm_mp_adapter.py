@@ -4,7 +4,7 @@ stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: ``.buildkite/k3_tests/multiprocess/scripts/run-restart-recovery.sh``."""
 
 # Standard
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 from unittest.mock import MagicMock
 import gc
 import os
@@ -526,7 +526,7 @@ def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> Non
     tracker.num_stored_tokens = 4
     tracker.allocated_block_ids = {0: [7]}
 
-    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector: Any = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {request.request_id: tracker}
     connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
 

@@ -166,7 +166,7 @@ def test_attention_lookup_keeps_full_prompt() -> None:
 
 def _scheduler_connector(
     *, has_recurrent_cache: bool, lookup_tokens: int
-) -> LMCacheMPConnector:
+) -> Any:
     connector: Any = object.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
     connector._has_recurrent_cache = has_recurrent_cache
