@@ -313,7 +313,12 @@ class StorageManagerConfig:
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
 
+    store_admission_timeout_seconds: float = 8.0
+    """ Total deadline for capacity-only L1 store admission retries. """
+
     def __post_init__(self) -> None:
+        if self.store_admission_timeout_seconds < 0:
+            raise ValueError("store_admission_timeout_seconds must be >= 0")
         normalize_storage_manager_config(self)
         validate_storage_manager_config(self)
 
@@ -538,6 +543,12 @@ def add_storage_manager_args(
         help="The fraction of memory to evict when triggered (0.0 to 1.0). "
         "Default is 0.2.",
     )
+    eviction_group.add_argument(
+        "--store-admission-timeout-seconds",
+        type=float,
+        default=8.0,
+        help="Total deadline for capacity-only atomic L1 store retries.",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -676,6 +687,7 @@ def parse_args_to_config(
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
+        store_admission_timeout_seconds=args.store_admission_timeout_seconds,
     )
     return config
 

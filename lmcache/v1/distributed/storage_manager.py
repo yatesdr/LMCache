@@ -10,9 +10,13 @@ from typing import Iterator, Literal, Optional
 import threading
 import time
 
+# Third Party
+from opentelemetry import metrics
+
 # First Party
 from lmcache.lmcache_native import Bitmap, PeriodicEventNotifier
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.admission import AdmissionWaitResult
 from lmcache.v1.distributed.api import (
     CapacitySnapshot,
     MemoryLayoutDesc,
@@ -75,6 +79,31 @@ logger = init_logger(__name__)
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
         self._l1_manager = L1Manager(config.l1_manager_config)
+        self._store_admission_timeout_seconds = config.store_admission_timeout_seconds
+        self._admission_stats_lock = threading.Lock()
+        self._admission_stats = {
+            "waits": 0,
+            "retries": 0,
+            "successes_after_eviction": 0,
+            "exhausted_timeouts": 0,
+        }
+        admission_meter = metrics.get_meter("lmcache.l1.admission")
+        self._admission_waits = admission_meter.create_counter(
+            "lmcache_mp.l1_admission_waits",
+            description="Atomic L1 stores that waited for eviction capacity",
+        )
+        self._admission_retries = admission_meter.create_counter(
+            "lmcache_mp.l1_admission_retries",
+            description="Atomic L1 reservation attempts retried after waiting",
+        )
+        self._admission_successes = admission_meter.create_counter(
+            "lmcache_mp.l1_admission_successes_after_eviction",
+            description="Atomic L1 stores admitted after eviction backpressure",
+        )
+        self._admission_timeouts = admission_meter.create_counter(
+            "lmcache_mp.l1_admission_exhausted_timeouts",
+            description="Atomic L1 stores skipped after admission deadline",
+        )
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
         self._l1_config = config.l1_manager_config
@@ -179,14 +208,13 @@ class StorageManager:
 
     # External APIs for serving engine integration code to call
     @enable_tracing()
-    def reserve_write(
+    def reserve_write_detailed(
         self,
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         mode: Literal["new", "update", "all"],
-    ) -> dict[ObjectKey, MemoryObj]:
-        """
-        Reserve the object for writing into the storage manager.
+    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
+        """Reserve objects while preserving each L1 failure reason.
 
         Args:
             keys (list[ObjectKey]): List of object keys to reserve for writing.
@@ -198,9 +226,7 @@ class StorageManager:
             - "all": Reserve all writable objects regardless of existence.
 
         Returns:
-            dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
-                reserved memory objects. Note that not all requested keys could be
-                reserved (e.g., out of memory or write conflict)
+            Per-key ``(L1Error, MemoryObj | None)`` results.
         """
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
@@ -233,7 +259,78 @@ class StorageManager:
                 )
             )
 
-        return result
+        return reserve_result
+
+    @enable_tracing()
+    def reserve_write(
+        self,
+        keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+        mode: Literal["new", "update", "all"],
+    ) -> dict[ObjectKey, MemoryObj]:
+        """Reserve writable objects and return successful reservations."""
+        reserve_result = self.reserve_write_detailed(keys, layout_desc, mode)
+        return {
+            key: memory_obj
+            for key, (_error, memory_obj) in reserve_result.items()
+            if memory_obj is not None
+        }
+
+    def get_readable_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return complete readable keys without retaining their read locks."""
+        results = self._l1_manager.reserve_read(keys)
+        readable = [key for key, (_error, obj) in results.items() if obj is not None]
+        if readable:
+            self._l1_manager.finish_read(readable)
+        return readable
+
+    @property
+    def store_admission_timeout_seconds(self) -> float:
+        """Configured total deadline for capacity-only store retries."""
+        return self._store_admission_timeout_seconds
+
+    def get_capacity_generation(self) -> int:
+        """Return the current L1 allocator-change generation."""
+        return self._l1_manager.get_capacity_generation()
+
+    def request_immediate_eviction(self) -> None:
+        """Wake the L1 eviction loop for a capacity-blocked store."""
+        self._eviction_controller.request_immediate_eviction()
+
+    def wait_for_capacity_change(
+        self, generation: int, timeout: float
+    ) -> tuple[AdmissionWaitResult, int]:
+        """Wait for L1 capacity change or storage-manager shutdown."""
+        return self._l1_manager.wait_for_capacity_change(generation, timeout)
+
+    def record_admission_wait(self) -> None:
+        """Record an atomic store entering capacity backpressure."""
+        with self._admission_stats_lock:
+            self._admission_stats["waits"] += 1
+        self._admission_waits.add(1)
+
+    def record_admission_retry(self) -> None:
+        """Record an atomic reservation retry."""
+        with self._admission_stats_lock:
+            self._admission_stats["retries"] += 1
+        self._admission_retries.add(1)
+
+    def record_admission_success_after_eviction(self) -> None:
+        """Record admission that succeeded after capacity was released."""
+        with self._admission_stats_lock:
+            self._admission_stats["successes_after_eviction"] += 1
+        self._admission_successes.add(1)
+
+    def record_admission_timeout(self) -> None:
+        """Record exhausted capacity backpressure."""
+        with self._admission_stats_lock:
+            self._admission_stats["exhausted_timeouts"] += 1
+        self._admission_timeouts.add(1)
+
+    def get_admission_stats(self) -> dict[str, int]:
+        """Return process-level atomic admission counters."""
+        with self._admission_stats_lock:
+            return dict(self._admission_stats)
 
     @enable_tracing()
     def finish_write(
@@ -1118,6 +1215,7 @@ class StorageManager:
         """
         Close the storage manager and release all resources.
         """
+        self._l1_manager.begin_shutdown()
         self._prefetch_controller.stop()
         self._store_controller.stop()
         self._eviction_controller.stop()
@@ -1148,6 +1246,7 @@ class StorageManager:
             "l2_eviction_controller": l2_eviction,
             "l2_adapters": adapters,
             "num_l2_adapters": len(adapters),
+            "store_admission": self.get_admission_stats(),
         }
 
     def register_l2_listener(self, listener: L2AdapterListener) -> None:

@@ -24,10 +24,23 @@ from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
+    StoreAdmissionRejected,
 )
 from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
+
+
+def _validate_store_admission(context: dict[str, Any]) -> None:
+    """Raise a structured nonfatal error for rejected SHM admission."""
+    if context.get("success") is not False:
+        return
+    reason = str(context.get("failure_reason", "unknown"))
+    if reason in {"capacity_timeout", "shutdown"}:
+        raise StoreAdmissionRejected(reason)
+    raise RuntimeError(
+        f"server could not atomically reserve engine-driven store: {reason}"
+    )
 
 
 @dataclass(frozen=True)
@@ -178,6 +191,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             )
         response = future.result()
         context = response.context if isinstance(response.context, dict) else {}
+        _validate_store_admission(context)
         slots = context.get("slots")
         if not isinstance(slots, list):
             return None
@@ -204,6 +218,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             )
         response = future.result()
         context = response.context if isinstance(response.context, dict) else {}
+        _validate_store_admission(context)
         slots = context.get("slots")
         group_ids = context.get("group_ids")
         chunk_indices = context.get("chunk_indices")

@@ -107,6 +107,17 @@ class L1EvictionController(EvictionController):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
         self._last_extra_log = time.monotonic()
+        self._immediate_request = threading.Event()
+
+    def request_immediate_eviction(self) -> None:
+        """Wake the eviction loop for a capacity-blocked store."""
+        self._immediate_request.set()
+
+    def stop(self) -> None:
+        """Stop promptly even when the eviction loop is waiting."""
+        self._stop_flag.set()
+        self._immediate_request.set()
+        self._thread.join()
 
     def report_status(self) -> dict:
         return {
@@ -162,7 +173,10 @@ class L1EvictionController(EvictionController):
         eviction_ratio = self._eviction_config.eviction_ratio
 
         while not self._stop_flag.is_set():
-            time.sleep(1)
+            immediate = self._immediate_request.wait(timeout=1.0)
+            self._immediate_request.clear()
+            if self._stop_flag.is_set():
+                break
             used_bytes, total_bytes = self._l1_manager.get_memory_usage()
             if self._eviction_config.extra_logging_enabled:
                 self._maybe_log_memory_usage(used_bytes, total_bytes)
@@ -177,9 +191,10 @@ class L1EvictionController(EvictionController):
                 continue
 
             logger.info(
-                "L1 memory usage %.2f above watermark %.2f; triggering eviction.",
+                "L1 memory usage %.2f above watermark %.2f; triggering eviction%s.",
                 usage,
                 watermark,
+                " immediately" if immediate else "",
             )
             actions = self._eviction_policy.get_eviction_actions(
                 eviction_ratio,

@@ -11,6 +11,7 @@ import threading
 # First Party
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.admission import AdmissionWaitResult
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
@@ -186,6 +187,9 @@ class L1Manager:
 
     def __init__(self, config: L1ManagerConfig):
         self._lock = threading.Lock()
+        self._capacity_condition = threading.Condition()
+        self._capacity_generation = 0
+        self._closing = False
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
 
@@ -417,6 +421,8 @@ class L1Manager:
 
         freed_meta = [self._object_meta(obj) for obj in need_to_free]
         self._memory_manager.free(need_to_free)
+        if need_to_free:
+            self._notify_capacity_change()
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
@@ -621,6 +627,8 @@ class L1Manager:
 
         aborted_meta = [self._object_meta(obj) for obj in aborted_objs]
         self._memory_manager.free(aborted_objs)
+        if aborted_objs:
+            self._notify_capacity_change()
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(aborted_keys)
         self._event_bus.publish(
@@ -748,6 +756,8 @@ class L1Manager:
 
         freed_meta = [self._object_meta(obj) for obj in need_to_free]
         self._memory_manager.free(need_to_free)
+        if need_to_free:
+            self._notify_capacity_change()
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(successful_keys)
@@ -797,6 +807,8 @@ class L1Manager:
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            if all_memory_objs:
+                self._notify_capacity_change()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -827,6 +839,8 @@ class L1Manager:
 
         cleared_meta = [self._object_meta(obj) for obj in objs_to_free]
         self._memory_manager.free(objs_to_free)
+        if objs_to_free:
+            self._notify_capacity_change()
 
         if keys_to_clear:
             for listener in self._registered_listeners:
@@ -875,16 +889,46 @@ class L1Manager:
         """
         return self._memory_manager.get_memory_usage()
 
+    def get_capacity_generation(self) -> int:
+        """Return the allocator-change generation used by admission waiters."""
+        with self._capacity_condition:
+            return self._capacity_generation
+
+    def wait_for_capacity_change(
+        self, generation: int, timeout: float
+    ) -> tuple[AdmissionWaitResult, int]:
+        """Wait without holding the L1 object lock until memory is freed."""
+        with self._capacity_condition:
+            changed = self._capacity_condition.wait_for(
+                lambda: self._capacity_generation != generation or self._closing,
+                timeout=max(0.0, timeout),
+            )
+            current = self._capacity_generation
+            if self._closing:
+                return AdmissionWaitResult.SHUTDOWN, current
+            if changed and current != generation:
+                return AdmissionWaitResult.CHANGED, current
+            return AdmissionWaitResult.TIMEOUT, current
+
+    def begin_shutdown(self) -> None:
+        """Wake admission waiters before controller shutdown begins."""
+        with self._capacity_condition:
+            self._closing = True
+            self._capacity_condition.notify_all()
+
     def get_l1_memory_desc(self):
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
         return self._memory_manager.get_l1_memory_desc()
 
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
+        self.begin_shutdown()
         with self._lock:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            if all_memory_objs:
+                self._notify_capacity_change()
 
         self._memory_manager.close()
 
@@ -962,3 +1006,9 @@ class L1Manager:
             size_bytes=memory_obj.get_size(),
             backend=self._memory_manager.get_backend_type(memory_obj),
         )
+
+    def _notify_capacity_change(self) -> None:
+        """Wake waiters after allocator-owned bytes have been released."""
+        with self._capacity_condition:
+            self._capacity_generation += 1
+            self._capacity_condition.notify_all()

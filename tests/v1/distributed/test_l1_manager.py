@@ -50,6 +50,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.v1.distributed.admission import AdmissionWaitResult
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
     L1ManagerConfig,
@@ -1051,6 +1052,30 @@ class TestAbortWrite:
         state = manager.get_object_state(key)
         assert state is not None
         assert state.available_for_read()
+        manager.close()
+
+    def test_abort_write_wakes_capacity_waiters(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+        manager.reserve_write([key], [False], basic_layout)
+        generation = manager.get_capacity_generation()
+
+        manager.abort_write([key])
+        wait_result, observed = manager.wait_for_capacity_change(generation, 0.0)
+
+        assert wait_result is AdmissionWaitResult.CHANGED
+        assert observed > generation
+        manager.close()
+
+    def test_shutdown_wakes_capacity_waiters(self, basic_l1_config):
+        manager = L1Manager(basic_l1_config)
+        generation = manager.get_capacity_generation()
+
+        manager.begin_shutdown()
+        wait_result, observed = manager.wait_for_capacity_change(generation, 0.0)
+
+        assert wait_result is AdmissionWaitResult.SHUTDOWN
+        assert observed == generation
         manager.close()
 
 

@@ -1384,6 +1384,31 @@ def server_module_factory(
         Returns ``(module, mock_storage, mock_session, ctx)``.
         """
         mock_storage = mock_storage or MagicMock()
+        # First Party
+        from lmcache.v1.distributed.admission import AdmissionWaitResult
+        from lmcache.v1.distributed.error import L1Error
+
+        def _reserve_write_detailed(
+            obj_keys: list[str], *args: Any, **kwargs: Any
+        ) -> dict[str, tuple[Any, Any]]:
+            reserved = mock_storage.reserve_write(obj_keys, *args, **kwargs)
+            return {
+                obj_key: (
+                    (L1Error.SUCCESS, reserved[obj_key])
+                    if obj_key in reserved
+                    else (L1Error.KEY_NOT_WRITABLE, None)
+                )
+                for obj_key in obj_keys
+            }
+
+        mock_storage.reserve_write_detailed.side_effect = _reserve_write_detailed
+        mock_storage.get_readable_keys.side_effect = lambda keys: list(keys)
+        mock_storage.get_capacity_generation.return_value = 0
+        mock_storage.wait_for_capacity_change.return_value = (
+            AdmissionWaitResult.TIMEOUT,
+            0,
+        )
+        mock_storage.store_admission_timeout_seconds = 0.0
         if mock_session is None:
             mock_session = MagicMock()
             mock_session.get_hashes.return_value = [b"h"]
@@ -1732,11 +1757,11 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     assert module.commit_store(key, 3, b"") is False
 
 
-def test_server_prepare_store_releases_unused_reserved_write_locks(
+def test_server_prepare_store_rejects_reserved_object_without_tensor(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Ensure SHM prepare_store releases reserved keys that have no writable tensor."""
+    """SHM admission aborts a reserved object with no writable tensor."""
     # First Party
     from lmcache.v1.multiprocess.protocols.engine import PrepareStoreResponse
 
@@ -1762,7 +1787,10 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     key = _default_key()
     prepare_response = module.prepare_store(key, 5)
     assert isinstance(prepare_response, PrepareStoreResponse)
-    assert prepare_response.context == {"slots": [], "chunk_indices": []}
+    assert prepare_response.context == {
+        "success": False,
+        "failure_reason": "invalid_layout",
+    }
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
     mock_storage.abort_write.assert_called_once_with(reserved_keys)
     mock_storage.finish_write.assert_not_called()
@@ -2100,6 +2128,46 @@ def test_server_grouped_shm_labels_slots_and_releases_all_group_miss(
     miss = module.prepare_retrieve(key, 20)
     assert miss.success is False
     mock_storage.finish_read_prefetched.assert_called_once_with(["g0"])
+
+
+def test_server_grouped_shm_capacity_failure_aborts_every_group(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A partial multi-group allocation is never exposed as a cache store."""
+    # First Party
+    from lmcache.v1.distributed.error import L1Error
+
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+    memory_obj.shm_offset = 0
+    memory_obj.shm_byte_length = memory_obj.tensor.numel() * 4
+    module, _, _, ctx = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_group_pool", pool_size=16384
+        ),
+        chunk_size=8,
+        mock_storage=mock_storage,
+    )
+    mock_storage.reserve_write_detailed.side_effect = [
+        {"g0": (L1Error.SUCCESS, memory_obj)},
+        {"g1": (L1Error.OUT_OF_MEMORY, None)},
+    ]
+    mock_storage.get_readable_keys.return_value = []
+    mock_storage.get_readable_keys.side_effect = None
+    mock_storage.store_admission_timeout_seconds = 0.0
+    module.register_kv_cache_engine_driven_context(_grouped_register_payload())
+    cast(Any, ctx).resolve_obj_keys = MagicMock(return_value=[["g0"], ["g1"]])
+
+    response = module.prepare_store(_default_key(), 20)
+
+    assert response.context == {
+        "success": False,
+        "failure_reason": "capacity_timeout",
+    }
+    mock_storage.abort_write.assert_called_once_with(["g0"])
+    mock_storage.finish_write.assert_not_called()
 
 
 def test_server_grouped_shm_abort_discards_pending_reservations(

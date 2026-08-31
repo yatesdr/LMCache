@@ -13,7 +13,10 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.base import (
+    StoreAdmissionRejected,
+    gather_paged_kv_to_cpu,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
@@ -311,6 +314,14 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             "Async engine-driven commit_store failed for request_id=%s",
                             _request_id,
                         )
+                except StoreAdmissionRejected as exc:
+                    logger.warning(
+                        "Skipping async engine-driven cache store for "
+                        "request_id=%s: reason=%s",
+                        _request_id,
+                        exc.reason,
+                    )
+                    ok = False
                 except Exception:
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",

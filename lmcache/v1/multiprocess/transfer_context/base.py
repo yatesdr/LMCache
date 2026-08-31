@@ -144,6 +144,15 @@ class EngineDrivenContextMetadata:
         )
 
 
+class StoreAdmissionRejected(RuntimeError):
+    """Nonfatal server-side cache-store admission rejection."""
+
+    def __init__(self, reason: str) -> None:
+        """Initialize the rejection with its stable server reason."""
+        self.reason = reason
+        super().__init__(f"engine-driven store admission rejected: {reason}")
+
+
 class EngineDrivenContext(ABC):
     """Abstract base class for CPU-side KV data transfer contexts.
 
